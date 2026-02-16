@@ -96,15 +96,15 @@ The script will display:
 When updating records, the following changes will be made:
 
 **For the LEAVING school:**
-- Holdings record: Remove 583 field
-- Item record: Set "Committed to Retain" to "No"
-- Item record: Clear "Retention Reason"
+- Alma holdings record: Remove 583 field
+- Alma item record: Set "Committed to Retain" to "No"
+- Alma item record: Clear "Retention Reason"
 - WorldCat LHR: Remove 583 field
 
 **For the TAKING school:**
-- Holdings record: Add 583 field
-- Item record: Set "Committed to Retain" to "Yes"
-- Item record: Set "Retention Reason" to "CUNY Shared Print"
+- Alma holdings record: Add 583 field
+- Alma item record: Set "Committed to Retain" to "Yes"
+- Alma item record: Set "Retention Reason" to "CUNY Shared Print"
 - WorldCat LHR: Add 583 field
 
 ## Files Not in Repository
