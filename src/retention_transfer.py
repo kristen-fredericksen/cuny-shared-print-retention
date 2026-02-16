@@ -247,13 +247,39 @@ def lookup_item_by_barcode(barcode, school_code, schools, base_url):
         return None
 
 
+def check_item_status(item_data):
+    """
+    Check if the item is eligible for retention transfer based on its status.
+
+    Args:
+        item_data: The full item data from Alma API
+
+    Returns:
+        (is_eligible, status_description)
+        - is_eligible: True if base_status = 1 (Item in place)
+        - status_description: Human-readable status
+    """
+    item_info = item_data.get("item_data", {})
+    base_status = item_info.get("base_status", {})
+
+    status_value = base_status.get("value", "")
+    status_desc = base_status.get("desc", "Unknown status")
+
+    # base_status = 1 means "Item in place" (eligible)
+    # base_status = 0 means "Item not in place" (not eligible)
+    is_eligible = status_value == "1"
+
+    return is_eligible, status_desc
+
+
 def find_holding_institutions(barcode, leaving_school, schools, config):
     """
     Find all institutions that hold a copy of this item.
 
     1. Look up the barcode using the specified school's API key
-    2. Extract the Network Zone MMS ID
-    3. Query the Network Zone to find all holding institutions
+    2. Check if item is eligible (base_status = 1)
+    3. Extract the Network Zone MMS ID
+    4. Query the Network Zone to find all holding institutions
 
     Args:
         barcode: The item barcode
@@ -262,6 +288,7 @@ def find_holding_institutions(barcode, leaving_school, schools, config):
         config: Configuration dictionary
 
     Returns: (list of institution codes, bib_info dict)
+    Returns ("ineligible", bib_info) if item status is not "Item in place"
     """
     # Step 1: Look up the item by barcode using the leaving school's API key
     item_data = lookup_item_by_barcode(barcode, leaving_school, schools, config["base_url"])
@@ -276,6 +303,18 @@ def find_holding_institutions(barcode, leaving_school, schools, config):
     except KeyError:
         print("  Could not extract MMS ID from item data")
         return None, None
+
+    # Step 2: Check if item is eligible based on base_status
+    is_eligible, status_desc = check_item_status(item_data)
+    if not is_eligible:
+        print(f"  ⚠️  Item not eligible: {status_desc}")
+        return "ineligible", {
+            "mms_id": iz_mms_id,
+            "nz_mms_id": None,
+            "title": title,
+            "item_data": item_data,
+            "status": status_desc
+        }
 
     # Step 2: Get the Network Zone MMS ID
     nz_mms_id = get_nz_mms_id_from_item(item_data)
@@ -453,6 +492,22 @@ def process_barcodes(items, schools, config):
             })
             continue
 
+        # Check if item is ineligible due to status
+        if institutions == "ineligible":
+            title = bib_info.get("title", "Unknown") if bib_info else "Unknown"
+            status_desc = bib_info.get("status", "Unknown status")
+            results.append({
+                "barcode": barcode,
+                "status": "ineligible",
+                "title": title,
+                "leaving_school": leaving_school,
+                "replacement_school": None,
+                "eligible_schools": [],
+                "item_status": status_desc,
+                "bib_info": bib_info
+            })
+            continue
+
         title = bib_info.get("title", "Unknown") if bib_info else "Unknown"
         print(f"  Title: {title[:60]}...")
         print(f"  Held by: {len(institutions)} institution(s)")
@@ -498,10 +553,12 @@ def print_summary(results, schools):
     found = [r for r in results if r["status"] == "replacement_found"]
     no_replacement = [r for r in results if r["status"] == "no_replacement"]
     not_found = [r for r in results if r["status"] == "not_found"]
+    ineligible = [r for r in results if r["status"] == "ineligible"]
 
-    print(f"\nReplacement found:     {len(found)}")
+    print(f"\nReplacement found:       {len(found)}")
     print(f"No replacement (review): {len(no_replacement)}")
-    print(f"Not found in Alma:     {len(not_found)}")
+    print(f"Ineligible (wrong status): {len(ineligible)}")
+    print(f"Not found in Alma:       {len(not_found)}")
 
     if found:
         print("\n--- Items with Replacements ---")
@@ -520,6 +577,15 @@ def print_summary(results, schools):
             print(f"    Title: {r['title'][:50]}...")
             print(f"    From: {leaving_name} (no other schools hold this)")
 
+    if ineligible:
+        print("\n--- Ineligible Items (Item Not In Place) ---")
+        for r in ineligible:
+            leaving_name = schools.get(r["leaving_school"], {}).get("name", "Unknown")
+            status = r.get("item_status", "Unknown status")
+            print(f"  {r['barcode']}")
+            print(f"    Title: {r['title'][:50]}...")
+            print(f"    Status: {status}")
+
     if not_found:
         print("\n--- Barcodes Not Found ---")
         for r in not_found:
@@ -527,7 +593,7 @@ def print_summary(results, schools):
 
     print("=" * 60)
 
-    return found, no_replacement, not_found
+    return found, no_replacement, not_found, ineligible
 
 
 def main():
@@ -568,7 +634,7 @@ def main():
     results = process_barcodes(items, schools, config)
 
     # Print summary
-    found, no_replacement, not_found = print_summary(results, schools)
+    found, no_replacement, not_found, ineligible = print_summary(results, schools)
 
     # TODO Phase 2: Generate draft emails for 'found' items
     # TODO Phase 3-5: Update records after confirmation
