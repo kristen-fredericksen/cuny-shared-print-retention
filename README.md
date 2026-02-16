@@ -11,7 +11,7 @@ When a CUNY library can no longer retain a book it committed to keep, this scrip
 3. **Selects a replacement school** using these rules:
    - Must be a Shared Print participant
    - Prefers CUNY Graduate Center if they hold it
-   - Otherwise picks the largest school that holds it
+   - Otherwise picks the largest participating school that holds it
 4. **Flags items for withdrawal review** if no other schools hold them
 
 ## Project Status
