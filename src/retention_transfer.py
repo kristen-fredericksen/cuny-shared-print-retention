@@ -5,19 +5,25 @@ This script helps transfer retention commitments from one school to another
 when a school can no longer retain a book.
 
 Phase 1: Lookup and school selection
-- Reads barcodes from Excel file
-- Looks up holdings in Alma Network Zone
+- Reads barcodes and school codes from Excel file
+- Looks up each item using the specified school's API key
+- Queries Network Zone to find all schools holding the title
 - Selects replacement school based on rules
 
 Usage:
-    python retention_transfer.py barcodes.xlsx leaving_school_code
+    python retention_transfer.py barcodes.xlsx
+
+The Excel file should have two columns:
+    - Barcode: The item barcode
+    - School Code: The Alma Institution Code (e.g., 01CUNY_QC)
 
 Example:
-    python retention_transfer.py data/barcodes.xlsx 01CUNY_BC
+    python retention_transfer.py data/barcodes.xlsx
 """
 
 import os
 import sys
+import re
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -33,14 +39,14 @@ load_dotenv()
 def get_config():
     """Load configuration from environment variables."""
     config = {
-        "api_key": os.getenv("ALMA_API_KEY"),
+        "nz_api_key": os.getenv("ALMA_NZ_API_KEY"),  # Network Zone key
         "base_url": os.getenv("ALMA_API_BASE_URL", "https://api-na.hosted.exlibrisgroup.com"),
-        "schools_file": os.getenv("SCHOOLS_FILE", "data/schools.csv")
+        "schools_file": os.getenv("SCHOOLS_FILE", "data/schools_template.csv")
     }
 
-    if not config["api_key"]:
-        print("ERROR: No API key found!")
-        print("Make sure you have a .env file with ALMA_API_KEY=your_key_here")
+    if not config["nz_api_key"]:
+        print("ERROR: No Network Zone API key found!")
+        print("Make sure you have a .env file with ALMA_NZ_API_KEY=your_key_here")
         sys.exit(1)
 
     return config
@@ -92,20 +98,136 @@ def get_grad_center_code(schools):
 # ALMA API FUNCTIONS
 # =============================================================================
 
-def lookup_item_by_barcode(barcode, api_key, base_url):
+def lookup_item_by_barcode(barcode, schools, base_url):
     """
     Look up an item in Alma by its barcode.
+
+    Since barcode lookup requires an Institution Zone key, we try each
+    school's API key until we find the item.
+
     Returns the item data including which institution holds it.
     """
     url = f"{base_url}/almaws/v1/items"
+    headers = {"Accept": "application/json"}
+
+    # Try each school's API key
+    for code, school in schools.items():
+        api_key = school.get("api_key", "")
+        if not api_key or pd.isna(api_key):
+            continue
+
+        params = {
+            "item_barcode": barcode,
+            "apikey": api_key
+        }
+
+        try:
+            response = requests.get(url, params=params, headers=headers)
+
+            if response.status_code == 200:
+                return response.json()
+            # 400 means not found at this institution, try next
+
+        except requests.RequestException:
+            continue
+
+    return None  # Not found at any institution
+
+
+def get_nz_mms_id_from_item(item_data):
+    """
+    Extract the Network Zone MMS ID from item data.
+
+    The NZ MMS ID is stored in the network_number field with format:
+    (EXLNZ-01CUNY_NETWORK)991025135669706121
+    """
+    network_numbers = item_data.get("bib_data", {}).get("network_number", [])
+
+    for nn in network_numbers:
+        if "01CUNY_NETWORK" in nn and nn.startswith("(EXLNZ"):
+            # Extract the ID after the closing parenthesis
+            nz_mms_id = nn.split(")")[-1]
+            return nz_mms_id
+
+    return None
+
+
+def get_holding_institutions_from_nz(nz_mms_id, nz_api_key, base_url):
+    """
+    Get all institutions that have holdings for a bib record in the Network Zone.
+
+    Parses the MARC AVA fields from the bib record to find holding institutions.
+
+    Returns a list of institution codes (e.g., ['01CUNY_BC', '01CUNY_QC']).
+    """
+    url = f"{base_url}/almaws/v1/bibs/{nz_mms_id}"
+
+    params = {
+        "apikey": nz_api_key,
+        "expand": "p_avail"  # Include physical availability info
+    }
+
+    headers = {"Accept": "application/json"}
+
+    try:
+        response = requests.get(url, params=params, headers=headers)
+
+        if response.status_code != 200:
+            print(f"  Could not get NZ bib record (status {response.status_code})")
+            return []
+
+        data = response.json()
+
+        # Get the MARC XML from the 'anies' field
+        marc_xml = data.get("anies", [""])[0]
+
+        if not marc_xml:
+            return []
+
+        # Find all AVA fields (availability info) - these contain institution codes
+        # AVA subfield 'a' contains the institution code
+        ava_institutions = re.findall(
+            r'tag="AVA".*?<subfield code="a">(.*?)</subfield>',
+            marc_xml
+        )
+
+        # Deduplicate and return
+        return list(set(ava_institutions))
+
+    except requests.RequestException as e:
+        print(f"  Connection error: {e}")
+        return []
+
+
+def lookup_item_by_barcode(barcode, school_code, schools, base_url):
+    """
+    Look up an item in Alma by its barcode using a specific school's API key.
+
+    Args:
+        barcode: The item barcode to look up
+        school_code: The Alma Institution Code (e.g., 01CUNY_QC)
+        schools: Dictionary of school data
+        base_url: Alma API base URL
+
+    Returns the item data, or None if not found.
+    """
+    url = f"{base_url}/almaws/v1/items"
+    headers = {"Accept": "application/json"}
+
+    # Get the API key for the specified school
+    school = schools.get(school_code)
+    if not school:
+        print(f"  ERROR: School code '{school_code}' not found in schools file")
+        return None
+
+    api_key = school.get("api_key", "")
+    if not api_key or pd.isna(api_key):
+        print(f"  ERROR: No API key configured for {school['name']}")
+        return None
 
     params = {
         "item_barcode": barcode,
         "apikey": api_key
-    }
-
-    headers = {
-        "Accept": "application/json"
     }
 
     try:
@@ -114,7 +236,8 @@ def lookup_item_by_barcode(barcode, api_key, base_url):
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 400:
-            return None  # Not found
+            print(f"  Barcode not found at {school['name']}")
+            return None
         else:
             print(f"  API error (status {response.status_code})")
             return None
@@ -124,72 +247,62 @@ def lookup_item_by_barcode(barcode, api_key, base_url):
         return None
 
 
-def get_network_zone_holdings(mms_id, api_key, base_url):
-    """
-    Get all holdings for a bibliographic record from the Network Zone.
-    This shows which institutions have holdings linked to this record.
-
-    Note: This requires Network Zone API access.
-    """
-    url = f"{base_url}/almaws/v1/bibs/{mms_id}/holdings"
-
-    params = {
-        "apikey": api_key
-    }
-
-    headers = {
-        "Accept": "application/json"
-    }
-
-    try:
-        response = requests.get(url, params=params, headers=headers)
-
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"  Could not get holdings (status {response.status_code})")
-            return None
-
-    except requests.RequestException as e:
-        print(f"  Connection error: {e}")
-        return None
-
-
-def find_holding_institutions(barcode, api_key, base_url):
+def find_holding_institutions(barcode, leaving_school, schools, config):
     """
     Find all institutions that hold a copy of this item.
 
-    Returns a list of institution codes.
+    1. Look up the barcode using the specified school's API key
+    2. Extract the Network Zone MMS ID
+    3. Query the Network Zone to find all holding institutions
+
+    Args:
+        barcode: The item barcode
+        leaving_school: The Alma Institution Code of the school leaving retention
+        schools: Dictionary of school data
+        config: Configuration dictionary
+
+    Returns: (list of institution codes, bib_info dict)
     """
-    # First, look up the item to get its MMS ID
-    item_data = lookup_item_by_barcode(barcode, api_key, base_url)
+    # Step 1: Look up the item by barcode using the leaving school's API key
+    item_data = lookup_item_by_barcode(barcode, leaving_school, schools, config["base_url"])
 
     if not item_data:
         return None, None
 
-    # Get the MMS ID (bibliographic record ID)
+    # Get basic info
     try:
-        mms_id = item_data["bib_data"]["mms_id"]
+        iz_mms_id = item_data["bib_data"]["mms_id"]
         title = item_data["bib_data"].get("title", "Unknown title")
     except KeyError:
         print("  Could not extract MMS ID from item data")
         return None, None
 
-    # Get all holdings for this bib record
-    holdings_data = get_network_zone_holdings(mms_id, api_key, base_url)
+    # Step 2: Get the Network Zone MMS ID
+    nz_mms_id = get_nz_mms_id_from_item(item_data)
 
-    if not holdings_data or "holding" not in holdings_data:
-        return [], {"mms_id": mms_id, "title": title, "item_data": item_data}
+    if not nz_mms_id:
+        print("  Could not find Network Zone MMS ID")
+        # Fall back to just the originating institution
+        return [], {
+            "mms_id": iz_mms_id,
+            "nz_mms_id": None,
+            "title": title,
+            "item_data": item_data
+        }
 
-    # Extract institution codes from holdings
-    institutions = []
-    for holding in holdings_data["holding"]:
-        # The institution code might be in different places depending on setup
-        inst_code = holding.get("institution", {}).get("value", "")
-        if inst_code:
-            institutions.append(inst_code)
+    # Step 3: Query Network Zone for all holding institutions
+    institutions = get_holding_institutions_from_nz(
+        nz_mms_id, config["nz_api_key"], config["base_url"]
+    )
 
-    return institutions, {"mms_id": mms_id, "title": title, "item_data": item_data}
+    bib_info = {
+        "mms_id": iz_mms_id,
+        "nz_mms_id": nz_mms_id,
+        "title": title,
+        "item_data": item_data
+    }
+
+    return institutions, bib_info
 
 
 # =============================================================================
@@ -246,7 +359,15 @@ def select_replacement_school(holding_institutions, leaving_school, schools):
 # =============================================================================
 
 def read_barcodes(file_path):
-    """Read barcodes from Excel file."""
+    """
+    Read barcodes and school codes from Excel file.
+
+    Expected columns:
+        - Barcode: The item barcode
+        - School Code: The Alma Institution Code (e.g., 01CUNY_QC)
+
+    Returns a list of tuples: [(barcode, school_code), ...]
+    """
     print(f"Reading barcodes from: {file_path}")
 
     try:
@@ -255,30 +376,69 @@ def read_barcodes(file_path):
         print(f"ERROR: File not found: {file_path}")
         sys.exit(1)
 
-    # Use first column
-    column = df.columns[0]
-    barcodes = df[column].astype(str).tolist()
-    barcodes = [b for b in barcodes if b and b.lower() != 'nan']
+    if len(df.columns) < 2:
+        print("ERROR: Excel file must have two columns: Barcode and School Code")
+        print("       Example: Barcode | School Code")
+        print("                31699001195116 | 01CUNY_QC")
+        sys.exit(1)
 
-    print(f"Found {len(barcodes)} barcodes")
-    return barcodes
+    # Use first column as barcode, second column as school code
+    barcode_col = df.columns[0]
+    school_col = df.columns[1]
+
+    print(f"  Barcode column: '{barcode_col}'")
+    print(f"  School code column: '{school_col}'")
+
+    # Build list of (barcode, school_code) tuples
+    items = []
+    for _, row in df.iterrows():
+        barcode = str(row[barcode_col]).strip()
+        school_code = str(row[school_col]).strip()
+
+        if barcode and barcode.lower() != 'nan' and school_code and school_code.lower() != 'nan':
+            items.append((barcode, school_code))
+
+    print(f"Found {len(items)} items to process")
+    return items
 
 
-def process_barcodes(barcodes, leaving_school, schools, config):
+def process_barcodes(items, schools, config):
     """
     Process each barcode: look up holdings and select replacement school.
+
+    Args:
+        items: List of (barcode, school_code) tuples
+        schools: Dictionary of school data
+        config: Configuration dictionary
 
     Returns a list of results for each barcode.
     """
     results = []
-    total = len(barcodes)
+    total = len(items)
 
-    for i, barcode in enumerate(barcodes, 1):
+    for i, (barcode, leaving_school) in enumerate(items, 1):
         print(f"\n[{i}/{total}] Processing barcode: {barcode}")
+
+        # Validate leaving school
+        if leaving_school not in schools:
+            print(f"  ERROR: Unknown school code '{leaving_school}'")
+            results.append({
+                "barcode": barcode,
+                "status": "error",
+                "title": None,
+                "leaving_school": leaving_school,
+                "replacement_school": None,
+                "eligible_schools": [],
+                "error": f"Unknown school code: {leaving_school}"
+            })
+            continue
+
+        leaving_school_name = schools[leaving_school]["name"]
+        print(f"  Leaving school: {leaving_school_name}")
 
         # Find which institutions hold this item
         institutions, bib_info = find_holding_institutions(
-            barcode, config["api_key"], config["base_url"]
+            barcode, leaving_school, schools, config
         )
 
         if institutions is None:
@@ -287,6 +447,7 @@ def process_barcodes(barcodes, leaving_school, schools, config):
                 "barcode": barcode,
                 "status": "not_found",
                 "title": None,
+                "leaving_school": leaving_school,
                 "replacement_school": None,
                 "eligible_schools": []
             })
@@ -307,6 +468,7 @@ def process_barcodes(barcodes, leaving_school, schools, config):
                 "barcode": barcode,
                 "status": "no_replacement",
                 "title": title,
+                "leaving_school": leaving_school,
                 "replacement_school": None,
                 "eligible_schools": [],
                 "bib_info": bib_info
@@ -318,6 +480,7 @@ def process_barcodes(barcodes, leaving_school, schools, config):
                 "barcode": barcode,
                 "status": "replacement_found",
                 "title": title,
+                "leaving_school": leaving_school,
                 "replacement_school": replacement,
                 "eligible_schools": eligible_list,
                 "bib_info": bib_info
@@ -343,14 +506,19 @@ def print_summary(results, schools):
     if found:
         print("\n--- Items with Replacements ---")
         for r in found:
-            school_name = schools[r["replacement_school"]]["name"]
-            print(f"  {r['barcode']}: {school_name}")
+            leaving_name = schools.get(r["leaving_school"], {}).get("name", "Unknown")
+            replacement_name = schools[r["replacement_school"]]["name"]
+            print(f"  {r['barcode']}")
             print(f"    Title: {r['title'][:50]}...")
+            print(f"    From: {leaving_name} → To: {replacement_name}")
 
     if no_replacement:
         print("\n--- Items Flagged for Withdrawal Review ---")
         for r in no_replacement:
-            print(f"  {r['barcode']}: {r['title'][:50]}...")
+            leaving_name = schools.get(r["leaving_school"], {}).get("name", "Unknown")
+            print(f"  {r['barcode']}")
+            print(f"    Title: {r['title'][:50]}...")
+            print(f"    From: {leaving_name} (no other schools hold this)")
 
     if not_found:
         print("\n--- Barcodes Not Found ---")
@@ -365,16 +533,16 @@ def print_summary(results, schools):
 def main():
     """Main function."""
     # Check arguments
-    if len(sys.argv) < 3:
-        print("Usage: python retention_transfer.py <barcodes.xlsx> <leaving_school_code>")
+    if len(sys.argv) < 2:
+        print("Usage: python retention_transfer.py <barcodes.xlsx>")
+        print("\nThe Excel file should have two columns:")
+        print("  - Barcode: The item barcode")
+        print("  - School Code: The Alma Institution Code (e.g., 01CUNY_QC)")
         print("\nExample:")
-        print("  python retention_transfer.py data/barcodes.xlsx 01CUNY_BC")
-        print("\nThe leaving_school_code is the Alma Institution Code of the school")
-        print("that can no longer retain the items.")
+        print("  python retention_transfer.py data/barcodes.xlsx")
         sys.exit(1)
 
     barcode_file = sys.argv[1]
-    leaving_school = sys.argv[2]
 
     print("=" * 60)
     print("CUNY Shared Print - Retention Transfer (Phase 1)")
@@ -388,24 +556,16 @@ def main():
     schools = load_schools(config["schools_file"])
     print(f"Loaded {len(schools)} schools")
 
-    # Verify leaving school exists
-    if leaving_school not in schools:
-        print(f"\nERROR: School code '{leaving_school}' not found in schools file.")
-        print("Available codes:", list(schools.keys()))
-        sys.exit(1)
+    # Read barcodes and school codes
+    items = read_barcodes(barcode_file)
 
-    print(f"Leaving school: {schools[leaving_school]['name']} ({leaving_school})")
-
-    # Read barcodes
-    barcodes = read_barcodes(barcode_file)
-
-    if not barcodes:
-        print("No barcodes found. Exiting.")
+    if not items:
+        print("No items found. Exiting.")
         sys.exit(1)
 
     # Process barcodes
     print("\nLooking up items and selecting replacement schools...")
-    results = process_barcodes(barcodes, leaving_school, schools, config)
+    results = process_barcodes(items, schools, config)
 
     # Print summary
     found, no_replacement, not_found = print_summary(results, schools)
