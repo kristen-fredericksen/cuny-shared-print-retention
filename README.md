@@ -19,7 +19,7 @@ When a CUNY library can no longer retain a book it committed to keep, this scrip
 | Phase | Description | Status |
 |-------|-------------|--------|
 | **Phase 1** | Barcode lookup and replacement selection | ✅ Complete |
-| **Phase 2** | Draft email generation | 🔜 Planned |
+| **Phase 2** | Draft email generation | ✅ Complete |
 | **Phase 3** | Update leaving school's Alma records | 🔜 Planned |
 | **Phase 4** | Update taking school's Alma records | 🔜 Planned |
 | **Phase 5** | Update WorldCat holdings | 🔜 Planned |
@@ -60,7 +60,7 @@ cp .env.example .env
 
 2. **`data/schools_template.csv`** - Contains school information:
    - Name, Size (1=largest), Shared Print (Yes/No)
-   - Alma Institution Code, OCLC Symbol
+   - Alma Institution Code, OCLC Symbol, Primo View ID
    - Chief Librarian Name and Email
    - Alma API Key (for each school)
 
@@ -81,15 +81,27 @@ Create an Excel file with two columns:
 ### Running the Script
 
 ```bash
+# Run with default output directory (output/emails)
 python src/retention_transfer.py data/your_barcodes.xlsx
+
+# Or specify a custom output directory
+python src/retention_transfer.py data/your_barcodes.xlsx output/emails
 ```
 
 ### Output
 
-The script will display:
-- Items with recommended replacement schools
-- Items flagged for withdrawal review (no other schools hold them)
-- Barcodes not found in Alma
+The script will:
+1. Display a summary of items:
+   - Items with recommended replacement schools
+   - Items flagged for withdrawal review (no other schools hold them)
+   - Items ineligible due to status (not "Item in place")
+   - Barcodes not found in Alma
+
+2. Generate `.eml` files for each replacement school:
+   - Saved to `output/emails/` by default
+   - Double-click to open in Outlook as a draft message
+   - Includes school-specific Primo VE links for each title
+   - Batches multiple titles per school into one email
 
 ## Record Updates (Phases 3-5)
 

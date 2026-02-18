@@ -78,6 +78,7 @@ def load_schools(file_path):
             "shared_print": row["Shared Print"].strip().lower() == "yes",
             "code": code,
             "oclc_symbol": row.get("OCLC Symbol", ""),
+            "primo_view_id": row.get("Primo View ID", ""),
             "chief_librarian_name": row.get("Chief Librarian Name", ""),
             "chief_librarian_email": row.get("Chief Librarian Email", ""),
             "api_key": row.get("Alma API Key", "")
@@ -394,6 +395,231 @@ def select_replacement_school(holding_institutions, leaving_school, schools):
 
 
 # =============================================================================
+# PHASE 2: EMAIL GENERATION
+# =============================================================================
+
+def build_primo_link(nz_mms_id, school):
+    """
+    Build a Primo VE link for a Network Zone MMS ID, using the school's Primo instance.
+
+    CUNY's Primo VE URL format:
+    https://cuny-{inst_suffix}.primo.exlibrisgroup.com/permalink/{inst_code}/{view_id}/alma{nz_mms_id}
+
+    Args:
+        nz_mms_id: Network Zone MMS ID
+        school: School dictionary with 'code' and 'primo_view_id'
+
+    Returns:
+        Primo VE permalink URL, or None if missing data
+    """
+    if not nz_mms_id:
+        return None
+
+    inst_code = school.get("code", "")
+    primo_view_id = school.get("primo_view_id", "")
+
+    if not inst_code or not primo_view_id:
+        return None
+
+    # Extract the suffix from institution code (e.g., "01CUNY_BC" -> "bc")
+    inst_suffix = inst_code.split("_")[-1].lower()
+
+    return f"https://cuny-{inst_suffix}.primo.exlibrisgroup.com/permalink/{inst_code}/{primo_view_id}/alma{nz_mms_id}"
+
+
+def generate_draft_email(titles_for_school, replacement_code, schools):
+    """
+    Generate a draft email for one or more titles going to the same replacement school.
+
+    Args:
+        titles_for_school: List of result dictionaries for this school
+        replacement_code: Alma Institution Code of the replacement school
+        schools: Dictionary of school data
+
+    Returns:
+        Dictionary with email components: to, subject, body, titles list
+    """
+    replacement_school = schools[replacement_code]
+
+    # Get Chief Librarian info
+    chief_name = replacement_school.get("chief_librarian_name", "")
+    chief_email = replacement_school.get("chief_librarian_email", "")
+
+    # Get first name for greeting
+    first_name = chief_name.split()[0] if chief_name else "Colleague"
+
+    # Build the titles section (each title with its Primo link for the replacement school)
+    title_lines = []
+    titles_info = []
+    for result in titles_for_school:
+        title = result.get("title", "Unknown title")
+        nz_mms_id = result.get("bib_info", {}).get("nz_mms_id")
+        primo_link = build_primo_link(nz_mms_id, replacement_school)
+
+        if primo_link:
+            title_lines.append(f"{title}\n{primo_link}")
+        else:
+            title_lines.append(title)
+
+        titles_info.append({
+            "barcode": result["barcode"],
+            "title": title,
+            "primo_link": primo_link
+        })
+
+    # Join titles with blank lines between them
+    titles_section = "\n\n".join(title_lines)
+
+    # Adjust wording based on number of titles
+    if len(titles_for_school) == 1:
+        titles_phrase = "this title"
+    else:
+        titles_phrase = "these titles"
+
+    # Generate the email body
+    body = f"""Hi {first_name},
+
+Another CUNY library recently reported that they are no longer able to retain monographs they had previously committed to as part of our shared retention agreement. Rather than withdrawing the titles entirely from the consortium's retention pool, I'm reaching out to ask whether your library would be willing to take over the retention commitment for {titles_phrase}:
+
+{titles_section}
+
+If you're open to this, I'll update the relevant records accordingly. Please let me know if you'd be willing to assume this commitment or if you have any questions before deciding.
+
+Thank you for considering this request, and for your continued support of our shared collections.
+
+- Kristen"""
+
+    return {
+        "to": f"{chief_name} <{chief_email}>",
+        "subject": "CUNY Shared Print retention commitment inquiry",
+        "body": body,
+        "replacement_school": replacement_school["name"],
+        "replacement_code": replacement_code,
+        "titles": titles_info
+    }
+
+
+def save_eml_file(email, output_dir):
+    """
+    Save a draft email as an .eml file that Outlook can open.
+
+    Args:
+        email: Dictionary with to, subject, body, replacement_school, titles
+        output_dir: Directory to save the .eml file
+
+    Returns:
+        Path to the saved file
+    """
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from datetime import datetime
+    import os
+
+    # Create the email message
+    msg = MIMEMultipart('alternative')
+    msg['To'] = email['to']
+    msg['Subject'] = email['subject']
+    msg['X-Unsent'] = '1'  # Tells Outlook this is a draft
+
+    # Plain text version
+    text_part = MIMEText(email['body'], 'plain', 'utf-8')
+
+    # HTML version with clickable links
+    html_body = email['body'].replace('\n', '<br>\n')
+    # Make URLs clickable
+    for t in email['titles']:
+        if t['primo_link']:
+            # Replace the plain URL with a hyperlink
+            html_body = html_body.replace(
+                t['primo_link'],
+                f'<a href="{t["primo_link"]}">{t["title"]}</a>'
+            )
+            # Remove the title line since it's now in the link
+            html_body = html_body.replace(f'{t["title"]}<br>', '')
+
+    html_part = MIMEText(f'<html><body style="font-family: Arial, sans-serif;">{html_body}</body></html>', 'html', 'utf-8')
+
+    msg.attach(text_part)
+    msg.attach(html_part)
+
+    # Create filename from school name
+    safe_school_name = email['replacement_school'].replace(' ', '_').replace('/', '-')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f"retention_inquiry_{safe_school_name}_{timestamp}.eml"
+    filepath = os.path.join(output_dir, filename)
+
+    # Save the file
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(msg.as_string())
+
+    return filepath
+
+
+def print_draft_emails(results, schools, output_dir=None):
+    """
+    Generate draft emails, batching multiple titles per replacement school.
+    Optionally save as .eml files.
+
+    Args:
+        results: List of result dictionaries from process_barcodes()
+        schools: Dictionary of school data
+        output_dir: If provided, save .eml files to this directory
+    """
+    # Filter to only items with replacements
+    found = [r for r in results if r["status"] == "replacement_found"]
+
+    if not found:
+        print("\nNo draft emails to generate (no replacements found).")
+        return []
+
+    # Group by replacement school
+    by_school = {}
+    for result in found:
+        school_code = result["replacement_school"]
+        if school_code not in by_school:
+            by_school[school_code] = []
+        by_school[school_code].append(result)
+
+    print("\n" + "=" * 60)
+    print(f"DRAFT EMAILS ({len(by_school)} email(s) for {len(found)} title(s))")
+    print("=" * 60)
+
+    # Create output directory if needed
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    emails = []
+    saved_files = []
+    for i, (school_code, titles_for_school) in enumerate(by_school.items(), 1):
+        email = generate_draft_email(titles_for_school, school_code, schools)
+        emails.append(email)
+
+        print(f"\n--- Email {i} of {len(by_school)} ---")
+        print(f"To: {email['to']}")
+        print(f"Subject: {email['subject']}")
+        print(f"School: {email['replacement_school']}")
+        print(f"Titles: {len(email['titles'])}")
+        for t in email['titles']:
+            print(f"  - {t['barcode']}: {t['title'][:50]}...")
+
+        # Save as .eml file if output_dir provided
+        if output_dir:
+            filepath = save_eml_file(email, output_dir)
+            saved_files.append(filepath)
+            print(f"  Saved: {filepath}")
+        else:
+            print("-" * 40)
+            print(email['body'])
+            print("-" * 40)
+
+    if saved_files:
+        print(f"\n✓ Saved {len(saved_files)} .eml file(s) to: {output_dir}")
+        print("  Double-click to open in Outlook as a draft message.")
+
+    return emails
+
+
+# =============================================================================
 # MAIN WORKFLOW
 # =============================================================================
 
@@ -600,18 +826,21 @@ def main():
     """Main function."""
     # Check arguments
     if len(sys.argv) < 2:
-        print("Usage: python retention_transfer.py <barcodes.xlsx>")
+        print("Usage: python retention_transfer.py <barcodes.xlsx> [output_dir]")
         print("\nThe Excel file should have two columns:")
         print("  - Barcode: The item barcode")
         print("  - School Code: The Alma Institution Code (e.g., 01CUNY_QC)")
-        print("\nExample:")
+        print("\nOptional: Provide an output directory to save .eml files")
+        print("\nExamples:")
         print("  python retention_transfer.py data/barcodes.xlsx")
+        print("  python retention_transfer.py data/barcodes.xlsx output/emails")
         sys.exit(1)
 
     barcode_file = sys.argv[1]
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else "output/emails"
 
     print("=" * 60)
-    print("CUNY Shared Print - Retention Transfer (Phase 1)")
+    print("CUNY Shared Print - Retention Transfer (Phase 1 & 2)")
     print("=" * 60)
 
     # Load configuration
@@ -636,12 +865,15 @@ def main():
     # Print summary
     found, no_replacement, not_found, ineligible = print_summary(results, schools)
 
-    # TODO Phase 2: Generate draft emails for 'found' items
+    # Phase 2: Generate draft emails and save as .eml files
+    emails = print_draft_emails(results, schools, output_dir)
+
     # TODO Phase 3-5: Update records after confirmation
 
-    print("\nPhase 1 complete. Next steps:")
-    print("- Review the replacement selections above")
-    print("- Phase 2 will generate draft emails to send to replacement schools")
+    print("\nPhase 1 & 2 complete. Next steps:")
+    print("- Open the .eml files in Outlook and send to Chief Librarians")
+    print("- Wait for responses")
+    print("- Phase 3-5 will update records after confirmation")
 
 
 if __name__ == "__main__":
