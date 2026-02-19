@@ -10,15 +10,25 @@ Phase 1: Lookup and school selection
 - Queries Network Zone to find all schools holding the title
 - Selects replacement school based on rules
 
+Phase 2: Draft email generation
+- Generates .eml files for each replacement school
+- Includes school-specific Primo VE links
+
+Phase 3: Update leaving school's Alma records
+- Sets committed_to_retain to No on item record
+- Clears retention_reason on item record
+- Removes 583 field from holdings record (if no other retained items remain)
+
 Usage:
-    python retention_transfer.py barcodes.xlsx
+    python retention_transfer.py barcodes.xlsx [output_dir] [--sandbox]
 
 The Excel file should have two columns:
     - Barcode: The item barcode
     - School Code: The Alma Institution Code (e.g., 01CUNY_QC)
 
-Example:
+Examples:
     python retention_transfer.py data/barcodes.xlsx
+    python retention_transfer.py data/barcodes.xlsx output/emails --sandbox
 """
 
 import os
@@ -36,18 +46,34 @@ load_dotenv()
 # CONFIGURATION
 # =============================================================================
 
-def get_config():
-    """Load configuration from environment variables."""
-    config = {
-        "nz_api_key": os.getenv("ALMA_NZ_API_KEY"),  # Network Zone key
-        "base_url": os.getenv("ALMA_API_BASE_URL", "https://api-na.hosted.exlibrisgroup.com"),
-        "schools_file": os.getenv("SCHOOLS_FILE", "data/schools_template.csv")
-    }
+def get_config(sandbox=False):
+    """Load configuration from environment variables.
 
-    if not config["nz_api_key"]:
-        print("ERROR: No Network Zone API key found!")
-        print("Make sure you have a .env file with ALMA_NZ_API_KEY=your_key_here")
-        sys.exit(1)
+    Args:
+        sandbox: If True, use sandbox API keys instead of production keys.
+    """
+    if sandbox:
+        config = {
+            "nz_api_key": os.getenv("ALMA_SANDBOX_NZ_API_KEY"),
+            "base_url": os.getenv("ALMA_SANDBOX_API_BASE_URL", "https://api-na.hosted.exlibrisgroup.com"),
+            "schools_file": os.getenv("ALMA_SANDBOX_SCHOOLS_FILE", "data/schools_sandbox.csv"),
+            "sandbox": True
+        }
+        if not config["nz_api_key"]:
+            print("ERROR: No sandbox Network Zone API key found!")
+            print("Make sure your .env file has ALMA_SANDBOX_NZ_API_KEY=your_key_here")
+            sys.exit(1)
+    else:
+        config = {
+            "nz_api_key": os.getenv("ALMA_NZ_API_KEY"),
+            "base_url": os.getenv("ALMA_API_BASE_URL", "https://api-na.hosted.exlibrisgroup.com"),
+            "schools_file": os.getenv("SCHOOLS_FILE", "data/schools_template.csv"),
+            "sandbox": False
+        }
+        if not config["nz_api_key"]:
+            print("ERROR: No Network Zone API key found!")
+            print("Make sure you have a .env file with ALMA_NZ_API_KEY=your_key_here")
+            sys.exit(1)
 
     return config
 
@@ -620,6 +646,217 @@ def print_draft_emails(results, schools, output_dir=None):
 
 
 # =============================================================================
+# PHASE 3: UPDATE LEAVING SCHOOL'S ALMA RECORDS
+# =============================================================================
+
+def update_leaving_school_item(mms_id, holding_id, item_pid, api_key, base_url):
+    """
+    Update the leaving school's item record:
+    - Set committed_to_retain to false
+    - Clear retention_reason
+
+    Returns: (success, message)
+    """
+    url = f"{base_url}/almaws/v1/bibs/{mms_id}/holdings/{holding_id}/items/{item_pid}"
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    params = {"apikey": api_key}
+
+    # GET current item record
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code != 200:
+        return False, f"GET item failed (status {response.status_code}): {response.text}"
+
+    item = response.json()
+
+    # Modify retention fields
+    item["item_data"]["committed_to_retain"] = {"value": "false"}
+    item["item_data"]["retention_reason"] = {"value": ""}
+
+    # PUT updated item record
+    put_response = requests.put(url, params=params, headers=headers, json=item)
+    if put_response.status_code != 200:
+        return False, f"PUT item failed (status {put_response.status_code}): {put_response.text}"
+
+    return True, "Item updated: committed_to_retain=No, retention_reason cleared"
+
+
+def get_other_retained_items(mms_id, holding_id, current_item_pid, api_key, base_url):
+    """
+    Get all items under a holding that still have committed_to_retain=true,
+    excluding the current item being processed.
+
+    Returns: list of item PIDs with committed_to_retain=true (excluding current item)
+    """
+    url = f"{base_url}/almaws/v1/bibs/{mms_id}/holdings/{holding_id}/items"
+    headers = {"Accept": "application/json"}
+    params = {"apikey": api_key, "limit": 100}
+
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code != 200:
+        return None  # Error - can't determine, skip holdings update
+
+    data = response.json()
+    items = data.get("item", [])
+
+    retained = []
+    for item in items:
+        pid = item.get("item_data", {}).get("pid", "")
+        if pid == current_item_pid:
+            continue  # Skip current item
+        committed = item.get("item_data", {}).get("committed_to_retain", {}).get("value", "")
+        if committed == "true":
+            retained.append(pid)
+
+    return retained
+
+
+def update_leaving_school_holdings(mms_id, holding_id, item_pid, api_key, base_url):
+    """
+    Update the leaving school's holdings record:
+    - Remove the MARC 583 field, but only if no other retained items remain under this holding.
+
+    Returns: (success, message)
+    """
+    # Check for other retained items under this holding
+    other_retained = get_other_retained_items(mms_id, holding_id, item_pid, api_key, base_url)
+
+    if other_retained is None:
+        return False, "Could not check other items under this holding - skipping holdings update"
+
+    if other_retained:
+        return True, f"Holdings 583 field left in place ({len(other_retained)} other retained item(s) remain under this holding)"
+
+    # No other retained items - safe to remove 583 field
+    url = f"{base_url}/almaws/v1/bibs/{mms_id}/holdings/{holding_id}"
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    params = {"apikey": api_key}
+
+    # GET current holdings record
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code != 200:
+        return False, f"GET holdings failed (status {response.status_code}): {response.text}"
+
+    holdings = response.json()
+
+    # Remove 583 fields from MARC XML in the 'anies' field
+    marc_xml = holdings.get("anies", [""])[0]
+    if not marc_xml:
+        return True, "No MARC XML found in holdings - nothing to update"
+
+    # Remove all 583 datafield elements
+    updated_xml = re.sub(r'<datafield tag="583"[^>]*>.*?</datafield>', '', marc_xml, flags=re.DOTALL)
+
+    if updated_xml == marc_xml:
+        return True, "No 583 field found in holdings - nothing to remove"
+
+    holdings["anies"] = [updated_xml]
+
+    # PUT updated holdings record
+    put_response = requests.put(url, params=params, headers=headers, json=holdings)
+    if put_response.status_code != 200:
+        return False, f"PUT holdings failed (status {put_response.status_code}): {put_response.text}"
+
+    return True, "Holdings updated: 583 field removed"
+
+
+def update_leaving_school(result, schools, config):
+    """
+    Orchestrate Phase 3 updates for one item's leaving school.
+
+    Returns: dict with update results
+    """
+    leaving_school_code = result["leaving_school"]
+    school = schools[leaving_school_code]
+    api_key = school.get("api_key", "")
+    base_url = config["base_url"]
+
+    item_data = result.get("bib_info", {}).get("item_data", {})
+    mms_id = item_data.get("bib_data", {}).get("mms_id", "")
+    holding_id = item_data.get("holding_data", {}).get("holding_id", "")
+    item_pid = item_data.get("item_data", {}).get("pid", "")
+    title = result.get("title", "Unknown")
+
+    print(f"\n  Updating leaving school records for: {title[:60]}")
+    print(f"  School: {school['name']}")
+
+    if not all([mms_id, holding_id, item_pid, api_key]):
+        print("  ERROR: Missing required IDs or API key - skipping")
+        return {"status": "error", "message": "Missing IDs or API key"}
+
+    # Update item record
+    item_ok, item_msg = update_leaving_school_item(mms_id, holding_id, item_pid, api_key, base_url)
+    if item_ok:
+        print(f"  ✓ {item_msg}")
+    else:
+        print(f"  ✗ Item update failed: {item_msg}")
+        return {"status": "error", "message": item_msg}
+
+    # Update holdings record
+    holdings_ok, holdings_msg = update_leaving_school_holdings(mms_id, holding_id, item_pid, api_key, base_url)
+    if holdings_ok:
+        print(f"  ✓ {holdings_msg}")
+    else:
+        print(f"  ✗ Holdings update failed: {holdings_msg}")
+        return {"status": "partial", "message": f"Item updated but holdings failed: {holdings_msg}"}
+
+    return {"status": "success", "message": "Item and holdings updated"}
+
+
+def process_leaving_school_updates(results, schools, config):
+    """
+    Phase 3: Update leaving school records for all items where a replacement was found.
+    Asks for confirmation before making any changes.
+    """
+    found = [r for r in results if r["status"] == "replacement_found"]
+
+    if not found:
+        print("\nNo items to update.")
+        return
+
+    print("\n" + "=" * 60)
+    print(f"PHASE 3: UPDATE LEAVING SCHOOL RECORDS ({len(found)} item(s))")
+    print("=" * 60)
+
+    if config.get("sandbox"):
+        print("  ⚠️  SANDBOX MODE - changes will be made to sandbox only")
+    else:
+        print("  ⚠️  PRODUCTION MODE - changes will be made to live Alma records")
+
+    print("\nItems to update:")
+    for r in found:
+        leaving_name = schools.get(r["leaving_school"], {}).get("name", r["leaving_school"])
+        print(f"  - {r['title'][:60]}")
+        print(f"    Barcode: {r['barcode']} | School: {leaving_name}")
+
+    confirm = input(f"\nUpdate leaving school records for {len(found)} item(s)? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        print("Skipping Phase 3 updates.")
+        return
+
+    update_results = []
+    for result in found:
+        update = update_leaving_school(result, schools, config)
+        update_results.append({"barcode": result["barcode"], "title": result["title"], **update})
+
+    # Summary
+    succeeded = [u for u in update_results if u["status"] == "success"]
+    partial = [u for u in update_results if u["status"] == "partial"]
+    failed = [u for u in update_results if u["status"] == "error"]
+
+    print("\n--- Phase 3 Summary ---")
+    print(f"  ✓ Fully updated: {len(succeeded)}")
+    print(f"  ~ Partially updated: {len(partial)}")
+    print(f"  ✗ Failed: {len(failed)}")
+
+    if failed:
+        print("\nFailed items:")
+        for u in failed:
+            print(f"  - {u['barcode']}: {u['message']}")
+
+    return update_results
+
+
+# =============================================================================
 # MAIN WORKFLOW
 # =============================================================================
 
@@ -825,26 +1062,34 @@ def print_summary(results, schools):
 def main():
     """Main function."""
     # Check arguments
-    if len(sys.argv) < 2:
-        print("Usage: python retention_transfer.py <barcodes.xlsx> [output_dir]")
+    # Parse arguments - allow --sandbox flag anywhere
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    sandbox = "--sandbox" in sys.argv
+
+    if len(args) < 1:
+        print("Usage: python retention_transfer.py <barcodes.xlsx> [output_dir] [--sandbox]")
         print("\nThe Excel file should have two columns:")
         print("  - Barcode: The item barcode")
         print("  - School Code: The Alma Institution Code (e.g., 01CUNY_QC)")
-        print("\nOptional: Provide an output directory to save .eml files")
+        print("\nOptions:")
+        print("  output_dir  Directory to save .eml files (default: output/emails)")
+        print("  --sandbox   Use sandbox API keys instead of production")
         print("\nExamples:")
         print("  python retention_transfer.py data/barcodes.xlsx")
-        print("  python retention_transfer.py data/barcodes.xlsx output/emails")
+        print("  python retention_transfer.py data/barcodes.xlsx output/emails --sandbox")
         sys.exit(1)
 
-    barcode_file = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else "output/emails"
+    barcode_file = args[0]
+    output_dir = args[1] if len(args) > 1 else "output/emails"
 
     print("=" * 60)
-    print("CUNY Shared Print - Retention Transfer (Phase 1 & 2)")
+    print("CUNY Shared Print - Retention Transfer")
     print("=" * 60)
 
     # Load configuration
-    config = get_config()
+    config = get_config(sandbox=sandbox)
+    if sandbox:
+        print("⚠️  SANDBOX MODE")
     print(f"API Base URL: {config['base_url']}")
 
     # Load schools data
@@ -858,7 +1103,7 @@ def main():
         print("No items found. Exiting.")
         sys.exit(1)
 
-    # Process barcodes
+    # Phase 1: Look up items and select replacement schools
     print("\nLooking up items and selecting replacement schools...")
     results = process_barcodes(items, schools, config)
 
@@ -868,12 +1113,10 @@ def main():
     # Phase 2: Generate draft emails and save as .eml files
     emails = print_draft_emails(results, schools, output_dir)
 
-    # TODO Phase 3-5: Update records after confirmation
+    # Phase 3: Update leaving school's Alma records
+    process_leaving_school_updates(results, schools, config)
 
-    print("\nPhase 1 & 2 complete. Next steps:")
-    print("- Open the .eml files in Outlook and send to Chief Librarians")
-    print("- Wait for responses")
-    print("- Phase 3-5 will update records after confirmation")
+    # TODO Phase 4-5: Update taking school's records and WorldCat
 
 
 if __name__ == "__main__":
