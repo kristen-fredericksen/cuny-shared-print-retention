@@ -990,8 +990,10 @@ def build_583_field(marc_org_code):
         f'<subfield code="d">{RETENTION_583_END_DATE}</subfield>',
         f'<subfield code="f">{RETENTION_583_ORG_NAME}</subfield>',
         f'<subfield code="2">{RETENTION_583_SOURCE}</subfield>',
-        f'<subfield code="5">{marc_org_code}</subfield>',
     ]
+    # Only include $5 if a MARC org code is available
+    if marc_org_code:
+        subfields.append(f'<subfield code="5">{marc_org_code}</subfield>')
     subfields_xml = "\n    ".join(subfields)
     return f'<datafield tag="583" ind1="1" ind2=" ">\n    {subfields_xml}\n  </datafield>'
 
