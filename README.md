@@ -20,8 +20,8 @@ When a CUNY library can no longer retain a book it committed to keep, this scrip
 |-------|-------------|--------|
 | **Phase 1** | Barcode lookup and replacement selection | ✅ Complete |
 | **Phase 2** | Draft email generation | ✅ Complete |
-| **Phase 3** | Update leaving school's Alma records | 🔜 Planned |
-| **Phase 4** | Update taking school's Alma records | 🔜 Planned |
+| **Phase 3** | Update leaving school's Alma records | ✅ Complete |
+| **Phase 4** | Update taking school's Alma records | ✅ Complete |
 | **Phase 5** | Update WorldCat holdings | 🔜 Planned |
 
 ## Setup
@@ -80,13 +80,25 @@ Create an Excel file with two columns:
 
 ### Running the Script
 
-```bash
-# Run with default output directory (output/emails)
-python src/retention_transfer.py data/your_barcodes.xlsx
+> **Every time you open a new terminal**, activate the virtual environment first:
+> ```bash
+> cd /path/to/library-retention
+> source venv/bin/activate
+> ```
+> You'll see `(venv)` at the start of your prompt when it's active.
 
-# Or specify a custom output directory
-python src/retention_transfer.py data/your_barcodes.xlsx output/emails
+```bash
+# Sandbox mode (safe for testing)
+python3 src/retention_transfer.py data/your_barcodes.xlsx --sandbox
+
+# Production mode
+python3 src/retention_transfer.py data/your_barcodes.xlsx
+
+# Specify a custom output directory for .eml files
+python3 src/retention_transfer.py data/your_barcodes.xlsx output/emails --sandbox
 ```
+
+**Shortcut:** If you set up the `retention` shell alias (see below), just type `retention` instead of the `cd` and `source` commands.
 
 ### Output
 
@@ -118,6 +130,16 @@ When updating records, the following changes will be made:
 - Alma item record: Set "Committed to Retain" to "Yes"
 - Alma item record: Set "Retention Reason" to "CUNY Shared Print"
 - WorldCat LHR: Add 583 field
+
+## Shell Alias (Optional Shortcut)
+
+To avoid typing the full `cd` and `source` commands every time, you can add a shortcut to your terminal. Run this once:
+
+```bash
+echo 'alias retention="cd /Users/kristenfredericksen/Library/CloudStorage/OneDrive-CUNY/agentic-projects/library-retention && source venv/bin/activate"' >> ~/.zshrc && source ~/.zshrc
+```
+
+After that, just type `retention` in any terminal window to navigate to the project and activate the virtual environment.
 
 ## Files Not in Repository
 
