@@ -19,6 +19,11 @@ Phase 3: Update leaving school's Alma records
 - Clears retention_reason on item record
 - Removes 583 field from holdings record (if no other retained items remain)
 
+Phase 4: Update taking school's Alma records
+- Sets committed_to_retain to Yes on item record
+- Sets retention_reason to CUNYSharedPrint on item record
+- Adds 583 field to holdings record
+
 Usage:
     python retention_transfer.py barcodes.xlsx [output_dir] [--sandbox]
 
@@ -107,6 +112,7 @@ def load_schools(file_path):
             "primo_view_id": row.get("Primo View ID", ""),
             "chief_librarian_name": row.get("Chief Librarian Name", ""),
             "chief_librarian_email": row.get("Chief Librarian Email", ""),
+            "marc_org_code": row.get("MARC Org Code", ""),
             "api_key": row.get("Alma API Key", "")
         }
 
@@ -857,6 +863,369 @@ def process_leaving_school_updates(results, schools, config):
 
 
 # =============================================================================
+# PHASE 4: UPDATE TAKING SCHOOL'S ALMA RECORDS
+# =============================================================================
+
+# 583 field constants for CUNY Shared Print retention
+RETENTION_583_START_DATE = "20241001"   # $c  Program start date (fixed)
+RETENTION_583_END_DATE   = "20380930"   # $d  Program end date (fixed)
+RETENTION_583_ORG_NAME   = "CUNY"       # $f  Consortium name
+RETENTION_583_SOURCE     = "pda"        # $2  Source/scheme
+
+
+def get_taking_school_iz_mms_id(nz_mms_id, api_key, base_url):
+    """
+    Look up the taking school's Institution Zone MMS ID using the NZ MMS ID.
+
+    Calls: GET /almaws/v1/bibs?nz_mms_id={nz_mms_id}  with the taking school's IZ API key.
+    Alma returns the corresponding IZ bib record for that school.
+
+    Args:
+        nz_mms_id: Network Zone MMS ID (from Phase 1 lookup)
+        api_key:   Taking school's Institution Zone API key
+        base_url:  Alma API base URL
+
+    Returns:
+        IZ MMS ID string, or None if not found
+    """
+    url = f"{base_url}/almaws/v1/bibs"
+    headers = {"Accept": "application/json"}
+    params = {"nz_mms_id": nz_mms_id, "apikey": api_key}
+
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        if response.status_code != 200:
+            return None, f"GET bib by NZ MMS ID failed (status {response.status_code}): {response.text}"
+
+        data = response.json()
+        bibs = data.get("bib", [])
+        if not bibs:
+            return None, "No IZ bib record found for this NZ MMS ID at the taking school"
+
+        iz_mms_id = bibs[0].get("mms_id")
+        return iz_mms_id, None
+
+    except requests.RequestException as e:
+        return None, f"Connection error: {e}"
+
+
+def get_taking_school_holding_and_item(iz_mms_id, api_key, base_url):
+    """
+    Find a holding and item record at the taking school for an IZ MMS ID.
+
+    We need a holding_id and item_pid to update the item's retention fields.
+    This picks the first holding that has at least one item.
+
+    Args:
+        iz_mms_id: Taking school's Institution Zone MMS ID
+        api_key:   Taking school's IZ API key
+        base_url:  Alma API base URL
+
+    Returns:
+        (holding_id, item_pid, error_message)
+        holding_id and item_pid are None if not found.
+    """
+    # GET all holdings for this bib
+    holdings_url = f"{base_url}/almaws/v1/bibs/{iz_mms_id}/holdings"
+    headers = {"Accept": "application/json"}
+    params = {"apikey": api_key}
+
+    try:
+        response = requests.get(holdings_url, params=params, headers=headers)
+        if response.status_code != 200:
+            return None, None, f"GET holdings failed (status {response.status_code}): {response.text}"
+
+        data = response.json()
+        holdings = data.get("holding", [])
+        if not holdings:
+            return None, None, "No holdings found at taking school"
+
+        # Try each holding until we find one with items
+        for holding in holdings:
+            holding_id = holding.get("holding_id")
+            if not holding_id:
+                continue
+
+            # GET items for this holding
+            items_url = f"{base_url}/almaws/v1/bibs/{iz_mms_id}/holdings/{holding_id}/items"
+            items_response = requests.get(items_url, params=params, headers=headers)
+            if items_response.status_code != 200:
+                continue
+
+            items_data = items_response.json()
+            items = items_data.get("item", [])
+            if not items:
+                continue
+
+            # Return first item's PID
+            item_pid = items[0].get("item_data", {}).get("pid")
+            if item_pid:
+                return holding_id, item_pid, None
+
+        return None, None, "No items found in any holding at taking school"
+
+    except requests.RequestException as e:
+        return None, None, f"Connection error: {e}"
+
+
+def build_583_field(marc_org_code):
+    """
+    Build the MARC XML for a 583 retention action note field.
+
+    Format:
+        583 1_ $a Committed to retain $c 20241001 $d 20380930 $f CUNY $2 pda $5 <marc_org_code>
+
+    The 583 field uses indicators "1" and " " (blank).
+
+    Args:
+        marc_org_code: The taking school's MARC organization code (e.g., "NyNyBC")
+
+    Returns:
+        XML string for the 583 datafield element
+    """
+    # Build subfields
+    subfields = [
+        f'<subfield code="a">Committed to retain</subfield>',
+        f'<subfield code="c">{RETENTION_583_START_DATE}</subfield>',
+        f'<subfield code="d">{RETENTION_583_END_DATE}</subfield>',
+        f'<subfield code="f">{RETENTION_583_ORG_NAME}</subfield>',
+        f'<subfield code="2">{RETENTION_583_SOURCE}</subfield>',
+        f'<subfield code="5">{marc_org_code}</subfield>',
+    ]
+    subfields_xml = "\n    ".join(subfields)
+    return f'<datafield tag="583" ind1="1" ind2=" ">\n    {subfields_xml}\n  </datafield>'
+
+
+def update_taking_school_item(iz_mms_id, holding_id, item_pid, api_key, base_url):
+    """
+    Update the taking school's item record:
+    - Set committed_to_retain to true
+    - Set retention_reason to CUNYSharedPrint
+
+    Returns: (success, message)
+    """
+    url = f"{base_url}/almaws/v1/bibs/{iz_mms_id}/holdings/{holding_id}/items/{item_pid}"
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    params = {"apikey": api_key}
+
+    # GET current item record
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code != 200:
+        return False, f"GET item failed (status {response.status_code}): {response.text}"
+
+    item = response.json()
+
+    # Modify retention fields
+    item["item_data"]["committed_to_retain"] = {"value": "true"}
+    item["item_data"]["retention_reason"] = {"value": "CUNYSharedPrint"}
+
+    # PUT updated item record
+    put_response = requests.put(url, params=params, headers=headers, json=item)
+    if put_response.status_code != 200:
+        return False, f"PUT item failed (status {put_response.status_code}): {put_response.text}"
+
+    return True, "Item updated: committed_to_retain=Yes, retention_reason=CUNYSharedPrint"
+
+
+def update_taking_school_holdings(iz_mms_id, holding_id, marc_org_code, api_key, base_url):
+    """
+    Update the taking school's holdings record by adding a MARC 583 field.
+
+    Only adds the field if one doesn't already exist (avoids duplicates).
+
+    Args:
+        iz_mms_id:     Taking school's IZ MMS ID
+        holding_id:    Holdings record ID
+        marc_org_code: Taking school's MARC organization code (for $5)
+        api_key:       Taking school's IZ API key
+        base_url:      Alma API base URL
+
+    Returns: (success, message)
+    """
+    url = f"{base_url}/almaws/v1/bibs/{iz_mms_id}/holdings/{holding_id}"
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    params = {"apikey": api_key}
+
+    # GET current holdings record
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code != 200:
+        return False, f"GET holdings failed (status {response.status_code}): {response.text}"
+
+    holdings = response.json()
+    marc_xml = holdings.get("anies", [""])[0]
+    if not marc_xml:
+        return False, "No MARC XML found in holdings record"
+
+    # Check if a 583 field already exists
+    if re.search(r'<datafield tag="583"', marc_xml):
+        return True, "Holdings already has a 583 field - no change needed"
+
+    # Build the new 583 field XML
+    new_583 = build_583_field(marc_org_code)
+
+    # Insert the 583 field before the closing </record> tag
+    if "</record>" not in marc_xml:
+        return False, "Could not find </record> tag in holdings MARC XML - cannot insert 583"
+
+    updated_xml = marc_xml.replace("</record>", f"  {new_583}\n</record>")
+
+    holdings["anies"] = [updated_xml]
+
+    # PUT updated holdings record
+    put_response = requests.put(url, params=params, headers=headers, json=holdings)
+    if put_response.status_code != 200:
+        return False, f"PUT holdings failed (status {put_response.status_code}): {put_response.text}"
+
+    return True, "Holdings updated: 583 field added"
+
+
+def update_taking_school(result, schools, config):
+    """
+    Orchestrate Phase 4 updates for one item's taking school.
+
+    Steps:
+    1. Look up the taking school's IZ MMS ID from the NZ MMS ID
+    2. Find the holding and item at the taking school
+    3. Update the item record (committed_to_retain, retention_reason)
+    4. Update the holdings record (add 583 field)
+
+    Returns: dict with update results, and stores IZ IDs back onto result
+             so Phase 5 (WorldCat) can use them.
+    """
+    taking_school_code = result.get("replacement_school")
+    if not taking_school_code:
+        return {"status": "error", "message": "No replacement school recorded"}
+
+    school = schools.get(taking_school_code)
+    if not school:
+        return {"status": "error", "message": f"School '{taking_school_code}' not in schools list"}
+
+    api_key = school.get("api_key", "")
+    marc_org_code = school.get("marc_org_code", "")
+    base_url = config["base_url"]
+
+    nz_mms_id = result.get("bib_info", {}).get("nz_mms_id")
+    title = result.get("title", "Unknown")
+
+    print(f"\n  Updating taking school records for: {title[:60]}")
+    print(f"  School: {school['name']}")
+
+    if not api_key or pd.isna(api_key):
+        print("  ERROR: No API key for taking school - skipping")
+        return {"status": "error", "message": "No API key for taking school"}
+
+    try:
+        marc_org_code_missing = not marc_org_code or pd.isna(marc_org_code) or str(marc_org_code).lower() == "nan"
+    except (TypeError, ValueError):
+        marc_org_code_missing = True
+    if marc_org_code_missing:
+        print("  WARNING: No MARC Org Code for taking school - 583 $5 subfield will be empty")
+        marc_org_code = ""
+
+    if not nz_mms_id:
+        print("  ERROR: No NZ MMS ID available - skipping")
+        return {"status": "error", "message": "No NZ MMS ID"}
+
+    # Step 1: Get taking school's IZ MMS ID
+    iz_mms_id, err = get_taking_school_iz_mms_id(nz_mms_id, api_key, base_url)
+    if err:
+        print(f"  ✗ Could not find IZ bib record: {err}")
+        return {"status": "error", "message": err}
+    print(f"  Found IZ MMS ID: {iz_mms_id}")
+
+    # Step 2: Find holding and item
+    holding_id, item_pid, err = get_taking_school_holding_and_item(iz_mms_id, api_key, base_url)
+    if err:
+        print(f"  ✗ Could not find holding/item: {err}")
+        return {"status": "error", "message": err}
+    print(f"  Found holding: {holding_id}, item: {item_pid}")
+
+    # Store IDs on result for Phase 5 (WorldCat)
+    result.setdefault("taking_school_ids", {})[taking_school_code] = {
+        "iz_mms_id": iz_mms_id,
+        "holding_id": holding_id,
+        "item_pid": item_pid
+    }
+
+    # Step 3: Update item record
+    item_ok, item_msg = update_taking_school_item(iz_mms_id, holding_id, item_pid, api_key, base_url)
+    if item_ok:
+        print(f"  ✓ {item_msg}")
+    else:
+        print(f"  ✗ Item update failed: {item_msg}")
+        return {"status": "error", "message": item_msg}
+
+    # Step 4: Update holdings record
+    holdings_ok, holdings_msg = update_taking_school_holdings(
+        iz_mms_id, holding_id, marc_org_code, api_key, base_url
+    )
+    if holdings_ok:
+        print(f"  ✓ {holdings_msg}")
+    else:
+        print(f"  ✗ Holdings update failed: {holdings_msg}")
+        return {"status": "partial", "message": f"Item updated but holdings failed: {holdings_msg}"}
+
+    return {"status": "success", "message": "Item and holdings updated"}
+
+
+def process_taking_school_updates(results, schools, config):
+    """
+    Phase 4: Update taking school records for all items where a replacement was found
+    AND Phase 3 succeeded (or was run).
+
+    Asks for user confirmation before making any changes.
+    """
+    # Only process items that have a replacement school
+    found = [r for r in results if r["status"] == "replacement_found"]
+
+    if not found:
+        print("\nNo items to update for taking school.")
+        return []
+
+    print("\n" + "=" * 60)
+    print(f"PHASE 4: UPDATE TAKING SCHOOL RECORDS ({len(found)} item(s))")
+    print("=" * 60)
+
+    if config.get("sandbox"):
+        print("  ⚠️  SANDBOX MODE - changes will be made to sandbox only")
+    else:
+        print("  ⚠️  PRODUCTION MODE - changes will be made to live Alma records")
+
+    print("\nItems to update:")
+    for r in found:
+        taking_name = schools.get(r["replacement_school"], {}).get("name", r["replacement_school"])
+        print(f"  - {r['title'][:60]}")
+        print(f"    Barcode: {r['barcode']} → Taking school: {taking_name}")
+
+    confirm = input(f"\nUpdate taking school records for {len(found)} item(s)? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        print("Skipping Phase 4 updates.")
+        return []
+
+    update_results = []
+    for result in found:
+        update = update_taking_school(result, schools, config)
+        update_results.append({"barcode": result["barcode"], "title": result["title"], **update})
+
+    # Summary
+    succeeded = [u for u in update_results if u["status"] == "success"]
+    partial = [u for u in update_results if u["status"] == "partial"]
+    failed = [u for u in update_results if u["status"] == "error"]
+
+    print("\n--- Phase 4 Summary ---")
+    print(f"  ✓ Fully updated: {len(succeeded)}")
+    print(f"  ~ Partially updated: {len(partial)}")
+    print(f"  ✗ Failed: {len(failed)}")
+
+    if failed:
+        print("\nFailed items:")
+        for u in failed:
+            print(f"  - {u['barcode']}: {u['message']}")
+
+    return update_results
+
+
+# =============================================================================
 # MAIN WORKFLOW
 # =============================================================================
 
@@ -1116,7 +1485,10 @@ def main():
     # Phase 3: Update leaving school's Alma records
     process_leaving_school_updates(results, schools, config)
 
-    # TODO Phase 4-5: Update taking school's records and WorldCat
+    # Phase 4: Update taking school's Alma records
+    process_taking_school_updates(results, schools, config)
+
+    # TODO Phase 5: Update WorldCat holdings
 
 
 if __name__ == "__main__":
