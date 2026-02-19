@@ -913,8 +913,10 @@ def get_taking_school_holding_and_item(iz_mms_id, api_key, base_url):
     """
     Find a holding and item record at the taking school for an IZ MMS ID.
 
-    We need a holding_id and item_pid to update the item's retention fields.
-    This picks the first holding that has at least one item.
+    If the bib has exactly one item across all holdings, return it.
+    If it has more than one item (e.g. multiple volumes or copies), return a
+    "needs_review" error — we cannot safely determine which item to update
+    without knowing the specific volume/copy the taking school is agreeing to retain.
 
     Args:
         iz_mms_id: Taking school's Institution Zone MMS ID
@@ -923,7 +925,8 @@ def get_taking_school_holding_and_item(iz_mms_id, api_key, base_url):
 
     Returns:
         (holding_id, item_pid, error_message)
-        holding_id and item_pid are None if not found.
+        holding_id and item_pid are None if not found or ambiguous.
+        error_message begins with "NEEDS_REVIEW:" if manual intervention is needed.
     """
     # GET all holdings for this bib
     holdings_url = f"{base_url}/almaws/v1/bibs/{iz_mms_id}/holdings"
@@ -940,29 +943,39 @@ def get_taking_school_holding_and_item(iz_mms_id, api_key, base_url):
         if not holdings:
             return None, None, "No holdings found at taking school"
 
-        # Try each holding until we find one with items
+        # Collect all items across all holdings
+        all_items = []  # list of (holding_id, item_pid, enumeration)
         for holding in holdings:
             holding_id = holding.get("holding_id")
             if not holding_id:
                 continue
 
-            # GET items for this holding
             items_url = f"{base_url}/almaws/v1/bibs/{iz_mms_id}/holdings/{holding_id}/items"
             items_response = requests.get(items_url, params=params, headers=headers)
             if items_response.status_code != 200:
                 continue
 
             items_data = items_response.json()
-            items = items_data.get("item", [])
-            if not items:
-                continue
+            for item in items_data.get("item", []):
+                item_pid = item.get("item_data", {}).get("pid")
+                enumeration = item.get("item_data", {}).get("enumeration_a", "")
+                if item_pid:
+                    all_items.append((holding_id, item_pid, enumeration))
 
-            # Return first item's PID
-            item_pid = items[0].get("item_data", {}).get("pid")
-            if item_pid:
-                return holding_id, item_pid, None
+        if not all_items:
+            return None, None, "No items found in any holding at taking school"
 
-        return None, None, "No items found in any holding at taking school"
+        if len(all_items) > 1:
+            # Multiple items — cannot safely pick one without enumeration matching
+            descriptions = ", ".join(
+                f"item {pid} ({enum})" if enum else f"item {pid}"
+                for _, pid, enum in all_items
+            )
+            return None, None, f"NEEDS_REVIEW: {len(all_items)} items found ({descriptions}) — cannot determine which to update without enumeration matching"
+
+        # Exactly one item — safe to proceed
+        holding_id, item_pid, _ = all_items[0]
+        return holding_id, item_pid, None
 
     except requests.RequestException as e:
         return None, None, f"Connection error: {e}"
@@ -1138,6 +1151,9 @@ def update_taking_school(result, schools, config):
     # Step 2: Find holding and item
     holding_id, item_pid, err = get_taking_school_holding_and_item(iz_mms_id, api_key, base_url)
     if err:
+        if err.startswith("NEEDS_REVIEW:"):
+            print(f"  ⚠️  Manual review required: {err[len('NEEDS_REVIEW:'):].strip()}")
+            return {"status": "needs_review", "message": err[len("NEEDS_REVIEW:"):].strip()}
         print(f"  ✗ Could not find holding/item: {err}")
         return {"status": "error", "message": err}
     print(f"  Found holding: {holding_id}, item: {item_pid}")
@@ -1212,12 +1228,20 @@ def process_taking_school_updates(results, schools, config):
     # Summary
     succeeded = [u for u in update_results if u["status"] == "success"]
     partial = [u for u in update_results if u["status"] == "partial"]
+    needs_review = [u for u in update_results if u["status"] == "needs_review"]
     failed = [u for u in update_results if u["status"] == "error"]
 
     print("\n--- Phase 4 Summary ---")
     print(f"  ✓ Fully updated: {len(succeeded)}")
     print(f"  ~ Partially updated: {len(partial)}")
+    print(f"  ⚠️  Needs manual review: {len(needs_review)}")
     print(f"  ✗ Failed: {len(failed)}")
+
+    if needs_review:
+        print("\nItems requiring manual review (multiple volumes/copies found):")
+        for u in needs_review:
+            print(f"  - {u['barcode']}: {u['title'][:60]}")
+            print(f"    {u['message']}")
 
     if failed:
         print("\nFailed items:")
