@@ -22,7 +22,7 @@ When a CUNY library can no longer retain a book it committed to keep, this scrip
 | **Phase 2** | Draft email generation | ✅ Complete |
 | **Phase 3** | Update leaving school's Alma records | ✅ Complete |
 | **Phase 4** | Update taking school's Alma records | ✅ Complete |
-| **Phase 5** | Update WorldCat holdings | 🔜 Planned |
+| **Phase 5** | Update WorldCat holdings | ✅ Complete |
 
 ## Setup
 
@@ -60,9 +60,10 @@ cp .env.example .env
 
 2. **`data/schools_template.csv`** - Contains school information:
    - Name, Size (1=largest), Shared Print (Yes/No)
-   - Alma Institution Code, OCLC Symbol, Primo View ID
+   - Alma Institution Code, OCLC Symbol, MARC Org Code, Primo View ID
    - Chief Librarian Name and Email
    - Alma API Key (for each school)
+   - OCLC Collection ID (7-digit data sync collection ID; required for Phase 5 WorldCat CSV generation)
 
 ## Usage
 
@@ -114,6 +115,16 @@ The script will:
    - Double-click to open in Outlook as a draft message
    - Includes school-specific Primo VE links for each title
    - Batches multiple titles per school into one email
+
+3. Generate WorldCat update files (Phase 5):
+   - **Taking school CSV** — saved to `output/worldcat/taking/`
+     - OCLC Full Format Shared Print file (14 columns)
+     - Filename: `<collectionID>.<OCLCsymbol>.sharedprint_retention_transfer_<YYYYMMDD>.csv`
+     - Upload via: WorldShare Metadata > My Files > Uploads > file type "Data sync LHR"
+     - Only generated for schools with an OCLC Collection ID in the schools CSV
+   - **Leaving school instructions** — saved to `output/worldcat/leaving/`
+     - Lists all records that need retention commitments removed
+     - Includes OCLC numbers, barcodes, and step-by-step removal instructions
 
 ## Record Updates (Phases 3-5)
 

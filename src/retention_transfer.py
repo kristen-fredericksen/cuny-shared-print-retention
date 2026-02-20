@@ -87,6 +87,31 @@ def get_config(sandbox=False):
 # SCHOOL DATA
 # =============================================================================
 
+def _clean_oclc_collection_id(raw):
+    """
+    Clean an OCLC Collection ID value read from a CSV/Excel cell.
+
+    pandas reads a blank numeric column as NaN, and a present integer like
+    1055226 as the float 1055226.0.  We want the clean string "1055226".
+
+    Returns "" for blank/NaN values, otherwise the integer string.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, float):
+        if pd.isna(raw):
+            return ""
+        return str(int(raw))
+    cleaned = str(raw).strip()
+    if cleaned.lower() in ("", "nan"):
+        return ""
+    # Handle a string like "1055226.0" produced by earlier str() conversion
+    try:
+        return str(int(float(cleaned)))
+    except ValueError:
+        return cleaned
+
+
 def load_schools(file_path):
     """
     Load the schools data from CSV file.
@@ -113,14 +138,24 @@ def load_schools(file_path):
             "chief_librarian_name": row.get("Chief Librarian Name", ""),
             "chief_librarian_email": row.get("Chief Librarian Email", ""),
             "marc_org_code": row.get("MARC Org Code", ""),
-            "api_key": row.get("Alma API Key", "")
+            "api_key": row.get("Alma API Key", ""),
+            "oclc_collection_id": _clean_oclc_collection_id(row.get("OCLC Collection ID", ""))
         }
 
     return schools
 
 
 def get_grad_center_code(schools):
-    """Find the Grad Center's institution code."""
+    """
+    Return the Grad Center's institution code.
+
+    We match on the known stable institution code rather than the name,
+    which could change or match other institutions unintentionally.
+    """
+    GRAD_CENTER_CODE = "01CUNY_GC"
+    if GRAD_CENTER_CODE in schools:
+        return GRAD_CENTER_CODE
+    # Fallback: name-based search for sandbox or unusual configs
     for code, school in schools.items():
         if "grad" in school["name"].lower() and "center" in school["name"].lower():
             return code
@@ -130,42 +165,6 @@ def get_grad_center_code(schools):
 # =============================================================================
 # ALMA API FUNCTIONS
 # =============================================================================
-
-def lookup_item_by_barcode(barcode, schools, base_url):
-    """
-    Look up an item in Alma by its barcode.
-
-    Since barcode lookup requires an Institution Zone key, we try each
-    school's API key until we find the item.
-
-    Returns the item data including which institution holds it.
-    """
-    url = f"{base_url}/almaws/v1/items"
-    headers = {"Accept": "application/json"}
-
-    # Try each school's API key
-    for code, school in schools.items():
-        api_key = school.get("api_key", "")
-        if not api_key or pd.isna(api_key):
-            continue
-
-        params = {
-            "item_barcode": barcode,
-            "apikey": api_key
-        }
-
-        try:
-            response = requests.get(url, params=params, headers=headers)
-
-            if response.status_code == 200:
-                return response.json()
-            # 400 means not found at this institution, try next
-
-        except requests.RequestException:
-            continue
-
-    return None  # Not found at any institution
-
 
 def get_nz_mms_id_from_item(item_data):
     """
@@ -661,6 +660,10 @@ def update_leaving_school_item(mms_id, holding_id, item_pid, api_key, base_url):
     - Set committed_to_retain to false
     - Clear retention_reason
 
+    Before making any change, verifies that committed_to_retain is currently
+    true.  If it is already false, warns and skips (avoids silently "removing"
+    a commitment that was never set).
+
     Returns: (success, message)
     """
     url = f"{base_url}/almaws/v1/bibs/{mms_id}/holdings/{holding_id}/items/{item_pid}"
@@ -673,6 +676,15 @@ def update_leaving_school_item(mms_id, holding_id, item_pid, api_key, base_url):
         return False, f"GET item failed (status {response.status_code}): {response.text}"
 
     item = response.json()
+
+    # Check that this item actually has a retention commitment to remove
+    current_committed = item.get("item_data", {}).get("committed_to_retain", {}).get("value", "")
+    if current_committed != "true":
+        return False, (
+            f"Item does not appear to have an active retention commitment "
+            f"(committed_to_retain='{current_committed}'). "
+            f"Skipping to avoid clearing a commitment that was never set."
+        )
 
     # Modify retention fields
     item["item_data"]["committed_to_retain"] = {"value": "false"}
@@ -833,6 +845,26 @@ def process_leaving_school_updates(results, schools, config):
         leaving_name = schools.get(r["leaving_school"], {}).get("name", r["leaving_school"])
         print(f"  - {r['title'][:60]}")
         print(f"    Barcode: {r['barcode']} | School: {leaving_name}")
+
+    # Warn if any taking school has no API key. If Phase 3 removes the leaving
+    # school's commitment but Phase 4 cannot run for the taking school, the
+    # item will have NO active retention commitment — an orphan.
+    taking_no_key = []
+    for r in found:
+        taking_code = r.get("replacement_school")
+        if taking_code:
+            taking_school = schools.get(taking_code, {})
+            api_key = taking_school.get("api_key", "")
+            if not api_key or (isinstance(api_key, float) and pd.isna(api_key)):
+                taking_no_key.append((r["barcode"], taking_school.get("name", taking_code)))
+    if taking_no_key:
+        print(f"\n⚠️  WARNING: {len(taking_no_key)} taking school(s) have no API key configured.")
+        print("   If you proceed with Phase 3, the leaving school's commitment will be")
+        print("   removed but Phase 4 will NOT be able to update the taking school.")
+        print("   This would leave the item with NO active retention commitment.")
+        for barcode, name in taking_no_key:
+            print(f"   - Barcode {barcode}: taking school {name} has no API key")
+        print("   Consider adding API keys for these schools before proceeding.")
 
     confirm = input(f"\nUpdate leaving school records for {len(found)} item(s)? (yes/no): ").strip().lower()
     if confirm != "yes":
@@ -1071,9 +1103,21 @@ def update_taking_school_holdings(iz_mms_id, holding_id, marc_org_code, api_key,
     if not marc_xml:
         return False, "No MARC XML found in holdings record"
 
-    # Check if a 583 field already exists
-    if re.search(r'<datafield tag="583"', marc_xml):
-        return True, "Holdings already has a 583 field - no change needed"
+    # Check if a CUNY Shared Print 583 field already exists.
+    # We look for a 583 that contains both "Committed to retain" and the CUNY
+    # org name, so we don't mistake an unrelated action note for our commitment.
+    existing_583s = re.findall(
+        r'<datafield tag="583"[^>]*>(.*?)</datafield>', marc_xml, flags=re.DOTALL
+    )
+    for field_xml in existing_583s:
+        has_committed = "Committed to retain" in field_xml or "committed to retain" in field_xml
+        has_cuny = RETENTION_583_ORG_NAME in field_xml
+        if has_committed and has_cuny:
+            return True, "Holdings already has a CUNY Shared Print 583 field - no change needed"
+
+    # A 583 exists but it is NOT a CUNY Shared Print commitment — warn and proceed
+    if existing_583s:
+        print(f"  ⚠️  Holdings has {len(existing_583s)} existing 583 field(s) that are NOT CUNY Shared Print — adding ours anyway")
 
     # Build the new 583 field XML
     new_583 = build_583_field(marc_org_code)
@@ -1252,6 +1296,373 @@ def process_taking_school_updates(results, schools, config):
 
 
 # =============================================================================
+# PHASE 5: GENERATE WORLDCAT CSV FILES
+# =============================================================================
+
+# OCLC Full Format Shared Print File Template column headers (14 columns)
+# These match the OCLC WorldShare Shared Print file specification.
+WORLDCAT_CSV_HEADERS = [
+    "OCLC Number",
+    "LSN",
+    "Library Symbol",
+    "Collection ID",
+    "ActionNote_583$a",
+    "PublicNote_583$z",
+    "ActionDate_583$c",
+    "ExpirationDate_583$d",
+    "Extent_of_commitment_583$n",
+    "Method_of_determination_583$l",
+    "Organization_583$f",
+    "URI_583$u",
+    "Copy_number_876-878$t",
+    "Enumeration/chronology_876-878$3"
+]
+
+
+def get_oclc_number_from_item(item_data):
+    """
+    Extract the OCLC number from item data returned by Alma barcode lookup.
+
+    Alma stores OCLC numbers in bib_data as 'oclc_number' or in the
+    network_number list. The OCLC number may appear with a leading prefix
+    like '(OCoLC)' which should be stripped.
+
+    Returns:
+        OCLC number string (digits only), or None if not found.
+    """
+    bib_data = item_data.get("bib_data", {})
+
+    # Check direct oclc_number field first
+    oclc_number = bib_data.get("oclc_number", "")
+    if oclc_number:
+        # Strip any prefix like "(OCoLC)"
+        cleaned = re.sub(r'^\(OCoLC\)', '', str(oclc_number)).strip()
+        if cleaned:
+            return cleaned
+
+    # Check network_number list for an OCLC entry
+    network_numbers = bib_data.get("network_number", [])
+    for nn in network_numbers:
+        if "(OCoLC)" in nn:
+            cleaned = re.sub(r'^\(OCoLC\)', '', nn).strip()
+            if cleaned:
+                return cleaned
+
+    return None
+
+
+def build_worldcat_row_taking(result, taking_school):
+    """
+    Build one CSV row for the TAKING school's WorldCat Shared Print submission.
+
+    The taking school is ADDING a retention commitment.
+
+    Args:
+        result: Result dictionary from process_barcodes / Phase 4
+        taking_school: School dictionary for the taking school
+
+    Returns:
+        List of values matching WORLDCAT_CSV_HEADERS order, or None if missing
+        required data (OCLC number).
+    """
+    from datetime import datetime
+
+    item_data = result.get("bib_info", {}).get("item_data", {})
+    oclc_number = get_oclc_number_from_item(item_data)
+    barcode = result.get("barcode", "")
+    oclc_symbol = taking_school.get("oclc_symbol", "")
+    collection_id = taking_school.get("oclc_collection_id", "")
+    action_date = datetime.now().strftime("%Y%m%d")
+
+    # OCLC number is required — without it the row cannot be processed
+    if not oclc_number:
+        return None
+
+    return [
+        oclc_number,                        # OCLC Number
+        barcode,                            # LSN (Local System Number / barcode)
+        oclc_symbol,                        # Library Symbol
+        collection_id,                      # Collection ID
+        "committed to retain",              # ActionNote_583$a
+        "",                                 # PublicNote_583$z (not used)
+        RETENTION_583_START_DATE,           # ActionDate_583$c (program start date)
+        RETENTION_583_END_DATE,             # ExpirationDate_583$d (program end date)
+        "",                                 # Extent_of_commitment_583$n (not used)
+        "",                                 # Method_of_determination_583$l (not used)
+        RETENTION_583_ORG_NAME,             # Organization_583$f
+        "",                                 # URI_583$u (not used)
+        "",                                 # Copy_number_876-878$t (not used)
+        ""                                  # Enumeration/chronology_876-878$3 (not used)
+    ]
+
+
+def generate_worldcat_taking_csv(results, schools, output_dir):
+    """
+    Generate OCLC WorldCat CSV files for the TAKING school — adding retention commitments.
+
+    Produces one CSV file per taking school (grouped by school).
+    File naming: <collectionID>.<OCLCsymbol>.sharedprint_retention_transfer_<YYYYMMDD>.csv
+
+    Files are saved to output_dir/worldcat/taking/.
+
+    Args:
+        results:    List of result dicts from process_barcodes (must have status=replacement_found)
+        schools:    Dictionary of school data
+        output_dir: Base output directory
+
+    Returns:
+        List of saved file paths.
+    """
+    import csv
+    from datetime import datetime
+
+    found = [r for r in results if r["status"] == "replacement_found"]
+    if not found:
+        return []
+
+    # Group by taking school
+    by_school = {}
+    for result in found:
+        taking_code = result.get("replacement_school")
+        if not taking_code:
+            continue
+        if taking_code not in by_school:
+            by_school[taking_code] = []
+        by_school[taking_code].append(result)
+
+    taking_dir = os.path.join(output_dir, "worldcat", "taking")
+    os.makedirs(taking_dir, exist_ok=True)
+
+    today = datetime.now().strftime("%Y%m%d")
+    saved_files = []
+    skipped_rows = []
+
+    for school_code, school_results in by_school.items():
+        school = schools.get(school_code, {})
+        oclc_symbol = school.get("oclc_symbol", "")
+        collection_id = school.get("oclc_collection_id", "")
+
+        if not collection_id:
+            print(f"  ⚠️  Skipping WorldCat CSV for {school.get('name', school_code)}: no OCLC Collection ID configured")
+            skipped_rows.append({
+                "school": school.get("name", school_code),
+                "reason": "No OCLC Collection ID in schools CSV"
+            })
+            continue
+
+        # Build filename
+        filename = f"{collection_id}.{oclc_symbol}.sharedprint_retention_transfer_{today}.csv"
+        filepath = os.path.join(taking_dir, filename)
+
+        rows = []
+        for result in school_results:
+            row = build_worldcat_row_taking(result, school)
+            if row is None:
+                barcode = result.get("barcode", "?")
+                title = result.get("title", "Unknown")
+                print(f"  ⚠️  Skipping {barcode} ({title[:40]}): no OCLC number found")
+                skipped_rows.append({
+                    "school": school.get("name", school_code),
+                    "barcode": barcode,
+                    "reason": "No OCLC number found in Alma record"
+                })
+                continue
+            rows.append(row)
+
+        if not rows:
+            print(f"  ⚠️  No valid rows for {school.get('name', school_code)} — CSV not saved")
+            continue
+
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(WORLDCAT_CSV_HEADERS)
+            writer.writerows(rows)
+
+        print(f"  ✓ Saved: {filepath} ({len(rows)} row(s))")
+        saved_files.append(filepath)
+
+    return saved_files, skipped_rows
+
+
+def generate_worldcat_leaving_instructions(results, schools, output_dir):
+    """
+    For the LEAVING school, generate a plain-text instructions file listing
+    the WorldCat LHRs that need to have their retention commitments removed.
+
+    Removing a commitment can be done in two ways (per OCLC documentation):
+    - Small batches: Use the LHR editor in WorldShare Record Manager to delete
+      or edit retention commitments manually.
+    - Large batches: Work with OCLC to set up a data sync collection to delete LHRs.
+
+    This function creates a report file to assist with manual or batch removal.
+
+    Args:
+        results:    List of result dicts (status=replacement_found)
+        schools:    Dictionary of school data
+        output_dir: Base output directory
+
+    Returns:
+        Path to saved instructions file, or None if no items.
+    """
+    from datetime import datetime
+
+    found = [r for r in results if r["status"] == "replacement_found"]
+    if not found:
+        return None
+
+    leaving_dir = os.path.join(output_dir, "worldcat", "leaving")
+    os.makedirs(leaving_dir, exist_ok=True)
+
+    today = datetime.now().strftime("%Y%m%d")
+    filename = f"worldcat_leaving_school_removal_instructions_{today}.txt"
+    filepath = os.path.join(leaving_dir, filename)
+
+    lines = []
+    lines.append("WORLDCAT SHARED PRINT RETENTION REMOVAL INSTRUCTIONS")
+    lines.append("=" * 60)
+    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("")
+    lines.append("The following items need their WorldCat Shared Print retention")
+    lines.append("commitments REMOVED from the leaving school's WorldCat LHR.")
+    lines.append("")
+    lines.append("HOW TO REMOVE RETENTION COMMITMENTS IN WORLDCAT:")
+    lines.append("")
+    lines.append("Option A - Small batches (a few records):")
+    lines.append("  Use the LHR editor in WorldShare Record Manager.")
+    lines.append("  Search for each OCLC number, open the LHR, and delete or")
+    lines.append("  edit the 583 retention commitment field.")
+    lines.append("")
+    lines.append("Option B - Large batches (many records):")
+    lines.append("  Work with your OCLC database specialist or implementation")
+    lines.append("  manager to create a data sync collection to delete LHRs.")
+    lines.append("  When deleting, choose whether to keep or delete the WorldCat")
+    lines.append("  holding on the bibliographic record.")
+    lines.append("")
+    lines.append("-" * 60)
+    lines.append("ITEMS TO PROCESS:")
+    lines.append("-" * 60)
+    lines.append("")
+
+    # Group by leaving school
+    by_school = {}
+    for result in found:
+        leaving_code = result.get("leaving_school")
+        if leaving_code not in by_school:
+            by_school[leaving_code] = []
+        by_school[leaving_code].append(result)
+
+    for school_code, school_results in by_school.items():
+        school = schools.get(school_code, {})
+        school_name = school.get("name", school_code)
+        oclc_symbol = school.get("oclc_symbol", "")
+        lines.append(f"School: {school_name} (OCLC Symbol: {oclc_symbol})")
+        lines.append("")
+
+        for result in school_results:
+            item_data = result.get("bib_info", {}).get("item_data", {})
+            oclc_number = get_oclc_number_from_item(item_data) or "UNKNOWN - check Alma record"
+            barcode = result.get("barcode", "")
+            title = result.get("title", "Unknown")
+            taking_code = result.get("replacement_school", "")
+            taking_name = schools.get(taking_code, {}).get("name", taking_code)
+
+            lines.append(f"  Title:       {title}")
+            lines.append(f"  Barcode:     {barcode}")
+            lines.append(f"  OCLC Number: {oclc_number}")
+            lines.append(f"  Transferred to: {taking_name}")
+            lines.append("")
+
+        lines.append("")
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return filepath
+
+
+def process_worldcat_updates(results, schools, config, output_dir):
+    """
+    Phase 5: Generate WorldCat CSV files and instructions for record updates.
+
+    For the TAKING school: generates an OCLC Full Format Shared Print CSV
+    to upload via WorldShare Metadata > My Files > Uploads (Data sync LHR).
+
+    For the LEAVING school: generates an instructions text file explaining
+    how to remove the retention commitments in WorldCat (via Record Manager
+    for small batches, or data sync collection for large batches).
+
+    Asks for confirmation before generating files.
+    """
+    found = [r for r in results if r["status"] == "replacement_found"]
+
+    if not found:
+        print("\nNo items to process for WorldCat updates.")
+        return
+
+    print("\n" + "=" * 60)
+    print(f"PHASE 5: GENERATE WORLDCAT UPDATE FILES ({len(found)} item(s))")
+    print("=" * 60)
+
+    print("\nThis will generate:")
+    print("  • CSV file(s) for TAKING school(s) — upload to OCLC WorldShare")
+    print("  • Instructions file for LEAVING school(s) — remove old commitments")
+
+    confirm = input(f"\nGenerate WorldCat update files for {len(found)} item(s)? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        print("Skipping Phase 5.")
+        return
+
+    # Derive the base output directory from output_dir.
+    # output_dir is typically "output/emails"; we want "output" as the base.
+    # We use os.path.dirname to go up one level, but only if output_dir ends
+    # with a recognised subdirectory name ("emails"). Otherwise use output_dir
+    # itself so that a custom path like "output/run1" still works sensibly.
+    output_dir_norm = os.path.normpath(output_dir)
+    if os.path.basename(output_dir_norm) == "emails":
+        worldcat_output = os.path.dirname(output_dir_norm)
+    else:
+        worldcat_output = output_dir_norm
+    # Ensure we always have an actual path, not an empty string
+    if not worldcat_output:
+        worldcat_output = "output"
+
+    # Generate taking school CSVs
+    print("\n--- Taking school CSV files ---")
+    saved_files, skipped = generate_worldcat_taking_csv(results, schools, worldcat_output)
+
+    # Generate leaving school instructions
+    print("\n--- Leaving school removal instructions ---")
+    instructions_path = generate_worldcat_leaving_instructions(results, schools, worldcat_output)
+    if instructions_path:
+        print(f"  ✓ Saved: {instructions_path}")
+
+    # Final summary
+    print("\n--- Phase 5 Summary ---")
+    if saved_files:
+        print(f"  ✓ Taking school CSV files saved: {len(saved_files)}")
+        for f in saved_files:
+            print(f"    {f}")
+        print()
+        print("  Next step for TAKING school files:")
+        print("  1. Log in to OCLC WorldShare Metadata")
+        print("  2. Go to My Files > Uploads")
+        print("  3. Select file type: 'Data sync LHR'")
+        print("  4. Upload each CSV file")
+    else:
+        print("  No taking school CSV files were saved.")
+        if skipped:
+            print("  Skipped schools (missing OCLC Collection ID):")
+            for s in skipped:
+                print(f"    - {s['school']}: {s['reason']}")
+
+    if instructions_path:
+        print(f"\n  ✓ Leaving school instructions: {instructions_path}")
+        print("  Next step for LEAVING school files:")
+        print("  • Small batches: use WorldShare Record Manager LHR editor")
+        print("  • Large batches: contact OCLC to set up a delete-LHR data sync collection")
+
+
+# =============================================================================
 # MAIN WORKFLOW
 # =============================================================================
 
@@ -1289,11 +1700,30 @@ def read_barcodes(file_path):
     # Build list of (barcode, school_code) tuples
     items = []
     for _, row in df.iterrows():
-        barcode = str(row[barcode_col]).strip()
+        raw_barcode = row[barcode_col]
         school_code = str(row[school_col]).strip()
+
+        # Excel sometimes converts long numeric barcodes to floats (e.g. 3.9E+13).
+        # Convert float → int → string to recover the original digits.
+        if isinstance(raw_barcode, float) and not pd.isna(raw_barcode):
+            barcode = str(int(raw_barcode))
+        else:
+            barcode = str(raw_barcode).strip()
 
         if barcode and barcode.lower() != 'nan' and school_code and school_code.lower() != 'nan':
             items.append((barcode, school_code))
+
+    # Warn about duplicate barcodes — processing the same barcode twice could
+    # double-update records or generate duplicate emails.
+    seen = {}
+    for barcode, school_code in items:
+        seen.setdefault(barcode, []).append(school_code)
+    duplicates = {b: schools_list for b, schools_list in seen.items() if len(schools_list) > 1}
+    if duplicates:
+        print(f"\n⚠️  WARNING: {len(duplicates)} duplicate barcode(s) found in input file:")
+        for barcode, schools_list in duplicates.items():
+            print(f"  {barcode} appears {len(schools_list)} time(s)")
+        print("  Each duplicate will be processed separately. Consider removing duplicates before proceeding.")
 
     print(f"Found {len(items)} items to process")
     return items
@@ -1332,6 +1762,12 @@ def process_barcodes(items, schools, config):
 
         leaving_school_name = schools[leaving_school]["name"]
         print(f"  Leaving school: {leaving_school_name}")
+
+        # Warn if the leaving school is not a Shared Print participant.
+        # This doesn't block processing, but it's probably a data entry error.
+        if not schools[leaving_school].get("shared_print", False):
+            print(f"  ⚠️  WARNING: {leaving_school_name} is not listed as a Shared Print participant."
+                  f" Proceeding, but verify this barcode is correct.")
 
         # Find which institutions hold this item
         institutions, bib_info = find_holding_institutions(
@@ -1514,7 +1950,8 @@ def main():
     # Phase 4: Update taking school's Alma records
     process_taking_school_updates(results, schools, config)
 
-    # TODO Phase 5: Update WorldCat holdings
+    # Phase 5: Generate WorldCat update files
+    process_worldcat_updates(results, schools, config, output_dir)
 
 
 if __name__ == "__main__":
