@@ -1,46 +1,55 @@
 """
 CUNY Shared Print Monograph Trust - Retention Transfer Script
 
-This script helps transfer retention commitments from one school to another
-when a school can no longer retain a book.
+This script transfers retention commitments from one school to another
+when a school can no longer retain a book. It runs in two separate steps
+to enforce the email-and-wait workflow:
 
-Phase 1: Lookup and school selection
-- Reads barcodes and school codes from Excel file
-- Looks up each item using the specified school's API key
-- Queries Network Zone to find all schools holding the title
-- Selects replacement school based on rules
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — LOOKUP  (run once, right away)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    python retention_transfer.py data/barcodes.xlsx [--sandbox]
 
-Phase 2: Draft email generation
-- Generates .eml files for each replacement school
-- Includes school-specific Primo VE links
+  - Reads barcodes from Excel, looks up each item in Alma
+  - Selects a replacement school for each item
+  - Generates draft .eml email files (one per replacement school)
+  - Saves a pending-transfers JSON file and then STOPS
+  - No Alma or WorldCat records are changed
 
-Phase 3: Update leaving school's Alma records
-- Sets committed_to_retain to No on item record
-- Clears retention_reason on item record
-- Removes 583 field from holdings record (if no other retained items remain)
+  The Excel file must have two columns:
+    Barcode      — the item barcode (e.g. 39016013760757)
+    School Code  — the leaving school's Alma code (e.g. 01CUNY_QC)
 
-Phase 4: Update taking school's Alma records
-- Sets committed_to_retain to Yes on item record
-- Sets retention_reason to CUNYSharedPrint on item record
-- Adds 583 field to holdings record
+  After this step: send the draft emails and wait for replies.
 
-Usage:
-    python retention_transfer.py barcodes.xlsx [output_dir] [--sandbox]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — UPDATE  (run after you receive replies)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    python retention_transfer.py output/pending_YYYYMMDD_HHMMSS.json --update [--sandbox]
 
-The Excel file should have two columns:
-    - Barcode: The item barcode
-    - School Code: The Alma Institution Code (e.g., 01CUNY_QC)
+  For each pending item, prompts: "Did [school] agree? (yes/no/skip)"
+    yes   — re-queries Alma to verify IDs, then updates Alma and generates
+            WorldCat CSV files (Phases 3, 4, 5)
+    no    — marks that school as declined, moves to the next eligible school,
+            generates a new draft email, saves updated pending file
+    skip  — leaves the item pending, tries again next run
 
-Examples:
-    python retention_transfer.py data/barcodes.xlsx
-    python retention_transfer.py data/barcodes.xlsx output/emails --sandbox
+  If all eligible schools decline, the item is flagged for withdrawal review.
+  The pending file is updated after each run so you can re-run as needed.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Options
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  --sandbox   Use sandbox API keys and sandbox schools file
 """
 
 import os
 import sys
 import re
+import json
 import requests
 import pandas as pd
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -1890,46 +1899,113 @@ def print_summary(results, schools):
     return found, no_replacement, not_found, ineligible
 
 
-def main():
-    """Main function."""
-    # Check arguments
-    # Parse arguments - allow --sandbox flag anywhere
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    sandbox = "--sandbox" in sys.argv
+# =============================================================================
+# PENDING TRANSFERS: FILE I/O
+# =============================================================================
 
-    if len(args) < 1:
-        print("Usage: python retention_transfer.py <barcodes.xlsx> [output_dir] [--sandbox]")
-        print("\nThe Excel file should have two columns:")
-        print("  - Barcode: The item barcode")
-        print("  - School Code: The Alma Institution Code (e.g., 01CUNY_QC)")
-        print("\nOptions:")
-        print("  output_dir  Directory to save .eml files (default: output/emails)")
-        print("  --sandbox   Use sandbox API keys instead of production")
-        print("\nExamples:")
-        print("  python retention_transfer.py data/barcodes.xlsx")
-        print("  python retention_transfer.py data/barcodes.xlsx output/emails --sandbox")
+def save_pending_transfers(results, output_dir, schools):
+    """
+    Save the results of Phase 1 (lookup) to a JSON file so that Phase 2
+    (update) can be run later, after email replies have been received.
+
+    Each item is stored with:
+      - All bib/item/holding IDs needed for Alma updates
+      - The full eligible_schools priority list (so declined schools can be
+        skipped and the next school tried automatically)
+      - A declined_schools list (empty at first)
+      - The proposed_school (first in the priority list)
+      - status: "awaiting_reply" | "needs_review" | "no_replacement" |
+                "not_found" | "ineligible" | "completed"
+      - lookup_date: ISO timestamp of when the lookup was run
+
+    Returns the path to the saved JSON file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"pending_{timestamp}.json"
+    filepath = os.path.join(output_dir, filename)
+
+    # Build a serialisable version of results.
+    # bib_info["item_data"] contains the raw Alma API response, which has
+    # nested dicts/lists — all JSON-serialisable already.
+    payload = {
+        "version": 1,
+        "created": datetime.now().isoformat(),
+        "items": []
+    }
+
+    for r in results:
+        # "replacement_found" means an email has been generated and sent;
+        # in the pending file we call this "awaiting_reply" to reflect that
+        # we are now waiting to hear back before making any record changes.
+        raw_status = r.get("status")
+        pending_status = "awaiting_reply" if raw_status == "replacement_found" else raw_status
+
+        item_entry = {
+            "barcode":           r.get("barcode"),
+            "title":             r.get("title"),
+            "status":            pending_status,
+            "leaving_school":    r.get("leaving_school"),
+            "proposed_school":   r.get("replacement_school"),   # first choice
+            "eligible_schools":  r.get("eligible_schools", []),
+            "declined_schools":  [],
+            "lookup_date":       datetime.now().isoformat(),
+            "bib_info":          r.get("bib_info"),             # may be None
+        }
+        # Carry through extra status fields where present
+        for extra_key in ("item_status", "error"):
+            if extra_key in r:
+                item_entry[extra_key] = r[extra_key]
+        payload["items"].append(item_entry)
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+    return filepath
+
+
+def load_pending_transfers(json_path):
+    """
+    Load a pending-transfers JSON file saved by save_pending_transfers().
+
+    Returns the parsed payload dict, or exits with an error message if the
+    file cannot be read or is not a valid pending-transfers file.
+    """
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        print(f"ERROR: Pending-transfers file not found: {json_path}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Could not parse pending-transfers file: {e}")
         sys.exit(1)
 
-    barcode_file = args[0]
-    output_dir = args[1] if len(args) > 1 else "output/emails"
+    if payload.get("version") != 1 or "items" not in payload:
+        print(f"ERROR: '{json_path}' does not look like a pending-transfers file.")
+        print("  Make sure you're passing the JSON file generated by the lookup step.")
+        sys.exit(1)
 
+    return payload
+
+
+# =============================================================================
+# STEP 1: LOOKUP PHASE  (Phases 1 + 2 — no record changes)
+# =============================================================================
+
+def run_lookup_phase(barcode_file, output_dir, config, schools):
+    """
+    Step 1: Look up barcodes, select replacement schools, generate draft
+    emails, and save a pending-transfers JSON file.
+
+    No Alma or WorldCat records are changed.
+    """
+    print("\n" + "=" * 60)
+    print("STEP 1: LOOKUP")
     print("=" * 60)
-    print("CUNY Shared Print - Retention Transfer")
-    print("=" * 60)
 
-    # Load configuration
-    config = get_config(sandbox=sandbox)
-    if sandbox:
-        print("⚠️  SANDBOX MODE")
-    print(f"API Base URL: {config['base_url']}")
-
-    # Load schools data
-    schools = load_schools(config["schools_file"])
-    print(f"Loaded {len(schools)} schools")
-
-    # Read barcodes and school codes
+    # Read barcodes
     items = read_barcodes(barcode_file)
-
     if not items:
         print("No items found. Exiting.")
         sys.exit(1)
@@ -1939,19 +2015,483 @@ def main():
     results = process_barcodes(items, schools, config)
 
     # Print summary
-    found, no_replacement, not_found, ineligible = print_summary(results, schools)
+    print_summary(results, schools)
 
-    # Phase 2: Generate draft emails and save as .eml files
-    emails = print_draft_emails(results, schools, output_dir)
+    # Phase 2: Generate draft emails
+    email_dir = os.path.join(output_dir, "emails")
+    print_draft_emails(results, schools, email_dir)
 
-    # Phase 3: Update leaving school's Alma records
-    process_leaving_school_updates(results, schools, config)
+    # Save pending-transfers file
+    pending_path = save_pending_transfers(results, output_dir, schools)
+    print(f"\n✓ Pending-transfers file saved: {pending_path}")
 
-    # Phase 4: Update taking school's Alma records
-    process_taking_school_updates(results, schools, config)
+    # Count actionable items
+    awaiting = [r for r in results if r["status"] == "replacement_found"]
+    if awaiting:
+        print(f"\n{'=' * 60}")
+        print("NEXT STEPS")
+        print("=" * 60)
+        print(f"  1. Open and send the draft email(s) in: {email_dir}/")
+        print(f"  2. Wait for replies from the chief librarians.")
+        print(f"  3. When you have a reply, run:")
+        print(f"\n     python retention_transfer.py \\")
+        print(f"         {pending_path} --update")
+        if config.get("sandbox"):
+            print(f"         --sandbox")
+        print()
+    else:
+        print("\nNo actionable items found (no replacements to email).")
+        print("Review the summary above for details.")
 
-    # Phase 5: Generate WorldCat update files
-    process_worldcat_updates(results, schools, config, output_dir)
+    return results, pending_path
+
+
+# =============================================================================
+# STEP 2: UPDATE PHASE  (Phases 3 + 4 + 5 — makes record changes)
+# =============================================================================
+
+def _re_verify_leaving_school_ids(result, schools, config):
+    """
+    Re-query Alma to confirm the leaving school's MMS ID, holding ID, and
+    item PID are still valid.  Uses the barcode (which is stable) to look up
+    the item fresh, then compares against the stored IDs.
+
+    Returns (mms_id, holding_id, item_pid, warning_message)
+    warning_message is None if everything matches, or a string describing any
+    discrepancy.
+    """
+    barcode        = result["barcode"]
+    leaving_code   = result["leaving_school"]
+    stored_bib     = result.get("bib_info", {}) or {}
+    stored_mms_id  = stored_bib.get("item_data", {}).get("bib_data", {}).get("mms_id", "")
+    stored_holding = stored_bib.get("item_data", {}).get("holding_data", {}).get("holding_id", "")
+    stored_pid     = stored_bib.get("item_data", {}).get("item_data", {}).get("pid", "")
+
+    fresh = lookup_item_by_barcode(barcode, leaving_code, schools, config["base_url"])
+    if not fresh:
+        return None, None, None, "Could not re-verify leaving school item — barcode no longer found in Alma"
+
+    fresh_mms_id  = fresh.get("bib_data",     {}).get("mms_id",     "")
+    fresh_holding = fresh.get("holding_data",  {}).get("holding_id", "")
+    fresh_pid     = fresh.get("item_data",     {}).get("pid",        "")
+
+    warnings = []
+    if stored_mms_id and fresh_mms_id != stored_mms_id:
+        warnings.append(f"MMS ID changed: was {stored_mms_id}, now {fresh_mms_id}")
+    if stored_holding and fresh_holding != stored_holding:
+        warnings.append(f"Holding ID changed: was {stored_holding}, now {fresh_holding}")
+    if stored_pid and fresh_pid != stored_pid:
+        warnings.append(f"Item PID changed: was {stored_pid}, now {fresh_pid}")
+
+    msg = "; ".join(warnings) if warnings else None
+    return fresh_mms_id, fresh_holding, fresh_pid, msg
+
+
+def _re_verify_taking_school_ids(result, taking_code, schools, config):
+    """
+    Re-query Alma to get fresh holding/item IDs for the taking school.
+
+    Uses the NZ MMS ID (stored in bib_info) to look up the taking school's
+    current IZ MMS ID, then retrieves holdings/items from that.
+
+    Returns (iz_mms_id, holding_id, item_pid, error_message)
+    error_message is None on success; begins with "NEEDS_REVIEW:" if ambiguous.
+    """
+    nz_mms_id = (result.get("bib_info") or {}).get("nz_mms_id")
+    if not nz_mms_id:
+        return None, None, None, "No NZ MMS ID stored — cannot re-verify taking school IDs"
+
+    school   = schools.get(taking_code, {})
+    api_key  = school.get("api_key", "")
+    base_url = config["base_url"]
+
+    iz_mms_id, err = get_taking_school_iz_mms_id(nz_mms_id, api_key, base_url)
+    if err:
+        return None, None, None, err
+
+    holding_id, item_pid, err = get_taking_school_holding_and_item(iz_mms_id, api_key, base_url)
+    if err:
+        return None, None, None, err
+
+    return iz_mms_id, holding_id, item_pid, None
+
+
+def _handle_decline(item_entry, schools, email_dir):
+    """
+    Record a decline from the current proposed_school, advance to the next
+    eligible school, and generate a new draft email if one is available.
+
+    Mutates item_entry in place.
+    Returns a human-readable message describing what happened.
+    """
+    declined = item_entry["proposed_school"]
+    if declined and declined not in item_entry["declined_schools"]:
+        item_entry["declined_schools"].append(declined)
+
+    # Find the next eligible school not yet declined
+    remaining = [
+        s for s in item_entry["eligible_schools"]
+        if s not in item_entry["declined_schools"]
+    ]
+
+    if not remaining:
+        item_entry["proposed_school"] = None
+        item_entry["status"] = "no_replacement"
+        return "All eligible schools have declined. Flagged for withdrawal review."
+
+    next_school = remaining[0]
+    item_entry["proposed_school"] = next_school
+    item_entry["status"] = "awaiting_reply"
+
+    # Build a minimal result dict that generate_draft_email expects
+    fake_result = {
+        "barcode":           item_entry["barcode"],
+        "title":             item_entry["title"],
+        "status":            "replacement_found",
+        "replacement_school": next_school,
+        "bib_info":          item_entry.get("bib_info"),
+    }
+
+    if email_dir:
+        os.makedirs(email_dir, exist_ok=True)
+        email = generate_draft_email([fake_result], next_school, schools)
+        filepath = save_eml_file(email, email_dir)
+        return f"Moved to next school: {schools[next_school]['name']}. New email: {filepath}"
+    else:
+        return f"Moved to next school: {schools[next_school]['name']}."
+
+
+def run_update_phase(json_path, output_dir, config, schools):
+    """
+    Step 2: Process replies to the emails sent in Step 1.
+
+    For each item that is 'awaiting_reply', prompts:
+        Did [school name] agree? (yes / no / skip)
+
+    yes   — re-queries Alma to get fresh IDs, then runs Phases 3, 4, 5
+    no    — records the decline, moves to next eligible school, new email
+    skip  — leaves the item pending for the next run
+
+    The pending JSON file is updated at the end of every run, so this
+    command can be re-run as many times as needed.
+    """
+    payload = load_pending_transfers(json_path)
+    items   = payload["items"]
+    created = payload.get("created", "unknown date")
+
+    email_dir      = os.path.join(output_dir, "emails")
+    worldcat_dir   = output_dir   # Phase 5 derives subdirs from this
+
+    print("\n" + "=" * 60)
+    print("STEP 2: UPDATE")
+    print("=" * 60)
+    print(f"  Pending file: {json_path}")
+    print(f"  Lookup date:  {created}")
+
+    # Tally statuses
+    awaiting   = [it for it in items if it["status"] == "awaiting_reply"]
+    completed  = [it for it in items if it["status"] == "completed"]
+    no_replace = [it for it in items if it["status"] == "no_replacement"]
+    other      = [it for it in items if it["status"] not in
+                  ("awaiting_reply", "completed", "no_replacement")]
+
+    print(f"\n  Awaiting reply:   {len(awaiting)}")
+    print(f"  Already complete: {len(completed)}")
+    print(f"  No replacement:   {len(no_replace)}")
+    if other:
+        print(f"  Other (skipped):  {len(other)}")
+
+    if not awaiting:
+        print("\nNo items awaiting a reply. Nothing to do.")
+        _print_update_summary(items, schools)
+        return
+
+    if config.get("sandbox"):
+        print("\n  ⚠️  SANDBOX MODE — changes will be made to sandbox only")
+    else:
+        print("\n  ⚠️  PRODUCTION MODE — changes will be made to live Alma records")
+
+    # -------------------------------------------------------------------------
+    # Per-item confirmation loop
+    # -------------------------------------------------------------------------
+    newly_completed = []
+    newly_declined  = []
+    skipped         = []
+    errors          = []
+
+    for i, item_entry in enumerate(awaiting, 1):
+        title        = item_entry.get("title", "Unknown")
+        barcode      = item_entry.get("barcode", "")
+        leaving_code = item_entry.get("leaving_school", "")
+        taking_code  = item_entry.get("proposed_school", "")
+        lookup_date  = item_entry.get("lookup_date", created)
+
+        leaving_name = schools.get(leaving_code, {}).get("name", leaving_code)
+        taking_name  = schools.get(taking_code,  {}).get("name", taking_code) if taking_code else "None"
+        declined_names = [schools.get(s, {}).get("name", s)
+                          for s in item_entry.get("declined_schools", [])]
+
+        print(f"\n{'─' * 60}")
+        print(f"[{i}/{len(awaiting)}] {title[:70]}")
+        print(f"  Barcode:       {barcode}")
+        print(f"  Leaving:       {leaving_name}")
+        print(f"  Proposed:      {taking_name}")
+        if declined_names:
+            print(f"  Declined so far: {', '.join(declined_names)}")
+        print(f"  Lookup date:   {lookup_date[:10]}")
+
+        if not taking_code:
+            print("  ⚠️  No proposed school — skipping (already exhausted all options?)")
+            skipped.append(barcode)
+            continue
+
+        answer = ""
+        while answer not in ("yes", "no", "skip"):
+            answer = input(f"\n  Did {taking_name} agree to take this commitment? (yes/no/skip): ").strip().lower()
+            if answer not in ("yes", "no", "skip"):
+                print("  Please type 'yes', 'no', or 'skip'.")
+
+        if answer == "skip":
+            print(f"  Skipping — will try again next run.")
+            skipped.append(barcode)
+            continue
+
+        if answer == "no":
+            msg = _handle_decline(item_entry, schools, email_dir)
+            print(f"  {msg}")
+            newly_declined.append(barcode)
+            continue
+
+        # ── answer == "yes" ──────────────────────────────────────────────────
+        print(f"\n  {taking_name} agreed. Re-verifying Alma IDs before making changes...")
+
+        # Re-verify leaving school IDs
+        l_mms_id, l_holding_id, l_item_pid, warn = _re_verify_leaving_school_ids(
+            item_entry, schools, config
+        )
+        if l_mms_id is None:
+            print(f"  ✗ Could not verify leaving school IDs: {warn}")
+            print(f"    Skipping this item — no changes made.")
+            errors.append({"barcode": barcode, "message": warn})
+            continue
+        if warn:
+            print(f"  ⚠️  Leaving school IDs changed since lookup: {warn}")
+            print(f"    Using updated IDs.")
+
+        # Re-verify taking school IDs
+        t_iz_mms_id, t_holding_id, t_item_pid, err = _re_verify_taking_school_ids(
+            item_entry, taking_code, schools, config
+        )
+        if err:
+            if err.startswith("NEEDS_REVIEW:"):
+                print(f"  ⚠️  Taking school needs manual review: {err[len('NEEDS_REVIEW:'):].strip()}")
+            else:
+                print(f"  ✗ Could not verify taking school IDs: {err}")
+            print(f"    Skipping this item — no changes made.")
+            errors.append({"barcode": barcode, "message": err})
+            continue
+
+        print(f"  IDs verified. Proceeding with updates...")
+
+        # Phase 3: Update leaving school
+        leaving_school  = schools[leaving_code]
+        l_api_key       = leaving_school.get("api_key", "")
+        item_ok, item_msg = update_leaving_school_item(
+            l_mms_id, l_holding_id, l_item_pid, l_api_key, config["base_url"]
+        )
+        if item_ok:
+            print(f"  ✓ Leaving school item: {item_msg}")
+        else:
+            print(f"  ✗ Leaving school item update failed: {item_msg}")
+            errors.append({"barcode": barcode, "message": item_msg})
+            continue
+
+        holdings_ok, holdings_msg = update_leaving_school_holdings(
+            l_mms_id, l_holding_id, l_item_pid, l_api_key, config["base_url"]
+        )
+        if holdings_ok:
+            print(f"  ✓ Leaving school holdings: {holdings_msg}")
+        else:
+            print(f"  ✗ Leaving school holdings update failed: {holdings_msg}")
+            # Non-fatal: continue to Phase 4
+
+        # Phase 4: Update taking school
+        taking_school   = schools[taking_code]
+        t_api_key       = taking_school.get("api_key", "")
+        marc_org_code   = taking_school.get("marc_org_code", "")
+        try:
+            marc_org_missing = not marc_org_code or pd.isna(marc_org_code) or str(marc_org_code).lower() == "nan"
+        except (TypeError, ValueError):
+            marc_org_missing = True
+        if marc_org_missing:
+            marc_org_code = ""
+
+        item_ok, item_msg = update_taking_school_item(
+            t_iz_mms_id, t_holding_id, t_item_pid, t_api_key, config["base_url"]
+        )
+        if item_ok:
+            print(f"  ✓ Taking school item: {item_msg}")
+        else:
+            print(f"  ✗ Taking school item update failed: {item_msg}")
+            errors.append({"barcode": barcode, "message": item_msg})
+            continue
+
+        holdings_ok, holdings_msg = update_taking_school_holdings(
+            t_iz_mms_id, t_holding_id, marc_org_code, t_api_key, config["base_url"]
+        )
+        if holdings_ok:
+            print(f"  ✓ Taking school holdings: {holdings_msg}")
+        else:
+            print(f"  ✗ Taking school holdings update failed: {holdings_msg}")
+            # Non-fatal: mark completed anyway, note the issue
+
+        # Phase 5: WorldCat CSV for this item
+        # Build a minimal result dict matching what generate_worldcat_taking_csv expects
+        worldcat_result = {
+            "status":             "replacement_found",
+            "barcode":            barcode,
+            "title":              title,
+            "replacement_school": taking_code,
+            "leaving_school":     leaving_code,
+            "bib_info":           item_entry.get("bib_info"),
+        }
+        wc_files, wc_skipped = generate_worldcat_taking_csv(
+            [worldcat_result], schools, worldcat_dir
+        )
+        if wc_files:
+            print(f"  ✓ WorldCat CSV: {wc_files[0]}")
+        elif wc_skipped:
+            print(f"  ⚠️  WorldCat CSV skipped: {wc_skipped[0]['reason']}")
+
+        wc_instructions = generate_worldcat_leaving_instructions(
+            [worldcat_result], schools, worldcat_dir
+        )
+        if wc_instructions:
+            print(f"  ✓ WorldCat leaving instructions: {wc_instructions}")
+
+        # Mark completed
+        item_entry["status"]         = "completed"
+        item_entry["completed_date"] = datetime.now().isoformat()
+        item_entry["taking_school"]  = taking_code
+        newly_completed.append(barcode)
+        print(f"  ✓ Transfer complete.")
+
+    # -------------------------------------------------------------------------
+    # Save updated pending file
+    # -------------------------------------------------------------------------
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+    print(f"\n✓ Pending file updated: {json_path}")
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    _print_update_summary(items, schools)
+
+    # Prompt for next steps if there are new emails to send
+    still_awaiting = [it for it in items if it["status"] == "awaiting_reply"]
+    if still_awaiting:
+        print(f"\n  {len(still_awaiting)} item(s) still awaiting a reply.")
+        print(f"  New draft emails (if any) were saved to: {email_dir}/")
+        print(f"  When you have more replies, run:")
+        print(f"\n     python retention_transfer.py \\")
+        print(f"         {json_path} --update")
+        if config.get("sandbox"):
+            print(f"         --sandbox")
+
+    if errors:
+        print(f"\n  ⚠️  {len(errors)} item(s) had errors and were NOT updated:")
+        for e in errors:
+            print(f"    - {e['barcode']}: {e['message']}")
+
+
+def _print_update_summary(items, schools):
+    """Print a tally of all item statuses in the pending file."""
+    print(f"\n{'=' * 60}")
+    print("STATUS OF ALL ITEMS")
+    print("=" * 60)
+
+    by_status = {}
+    for it in items:
+        s = it["status"]
+        by_status.setdefault(s, []).append(it)
+
+    status_labels = {
+        "completed":      "✓ Completed",
+        "awaiting_reply": "⏳ Awaiting reply",
+        "no_replacement": "⚠️  No replacement (withdrawal review)",
+        "not_found":      "✗ Not found in Alma",
+        "ineligible":     "✗ Ineligible (item not in place)",
+        "error":          "✗ Error",
+    }
+    for status, label in status_labels.items():
+        group = by_status.get(status, [])
+        if group:
+            print(f"\n  {label} ({len(group)}):")
+            for it in group:
+                taking = it.get("taking_school") or it.get("proposed_school")
+                taking_name = schools.get(taking, {}).get("name", taking) if taking else "—"
+                leaving_name = schools.get(it.get("leaving_school", ""), {}).get("name", "—")
+                print(f"    {it['barcode']}  {it.get('title', '')[:45]}")
+                print(f"      From: {leaving_name}  →  To: {taking_name}")
+
+    print("=" * 60)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    """
+    Entry point. Dispatches to lookup mode or update mode based on arguments.
+
+    Lookup mode (default):
+        python retention_transfer.py data/barcodes.xlsx [--sandbox]
+
+    Update mode:
+        python retention_transfer.py output/pending_YYYYMMDD_HHMMSS.json --update [--sandbox]
+    """
+    flags    = [a for a in sys.argv[1:] if a.startswith("--")]
+    args     = [a for a in sys.argv[1:] if not a.startswith("--")]
+    sandbox  = "--sandbox" in flags
+    update   = "--update"  in flags
+
+    if len(args) < 1:
+        print(__doc__)
+        sys.exit(1)
+
+    input_file = args[0]
+    output_dir = args[1] if len(args) > 1 else "output"
+
+    print("=" * 60)
+    print("CUNY Shared Print - Retention Transfer")
+    print("=" * 60)
+
+    config = get_config(sandbox=sandbox)
+    if sandbox:
+        print("⚠️  SANDBOX MODE")
+    print(f"API Base URL: {config['base_url']}")
+
+    schools = load_schools(config["schools_file"])
+    print(f"Loaded {len(schools)} schools")
+
+    if update:
+        # ── UPDATE MODE: first arg must be a .json pending-transfers file ──
+        if not input_file.endswith(".json"):
+            print(f"ERROR: --update requires a pending-transfers JSON file as the first argument.")
+            print(f"  Got: {input_file}")
+            print(f"  Example: python retention_transfer.py output/pending_20260220_143012.json --update")
+            sys.exit(1)
+        run_update_phase(input_file, output_dir, config, schools)
+    else:
+        # ── LOOKUP MODE: first arg must be an Excel file ──
+        if not (input_file.endswith(".xlsx") or input_file.endswith(".xls")):
+            print(f"ERROR: Lookup mode requires an Excel (.xlsx) file as the first argument.")
+            print(f"  Got: {input_file}")
+            print(f"  To run updates on an existing pending file, add --update.")
+            sys.exit(1)
+        run_lookup_phase(input_file, output_dir, config, schools)
 
 
 if __name__ == "__main__":
