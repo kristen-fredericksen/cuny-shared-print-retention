@@ -65,7 +65,29 @@ cp .env.example .env
    - Alma API Key (for each school)
    - OCLC Collection ID (7-digit data sync collection ID; required for Phase 5 WorldCat CSV generation)
 
-## Usage
+## Web App (Recommended)
+
+The easiest way to use this tool is through the Streamlit web app:
+
+**Option A — Double-click to launch:**
+- Open Finder, navigate to the `library-retention` folder
+- Double-click **`run_app.command`**
+- The app will open in your browser automatically
+
+**Option B — Launch from terminal:**
+```bash
+cd /path/to/library-retention
+source venv/bin/activate
+streamlit run src/app.py
+```
+
+The app has two tabs matching the two-step workflow:
+1. **Step 1 — Lookup**: Upload your barcodes Excel file, view results, and download draft emails
+2. **Step 2 — Update**: Upload the pending JSON from Step 1, record yes/no/skip for each school, and apply Alma + WorldCat updates
+
+## Command-Line Usage
+
+You can also run the script directly from the terminal.
 
 ### Input File Format
 
