@@ -111,12 +111,13 @@ def _read_file_bytes(path: str) -> bytes:
 def _status_badge(status: str) -> str:
     """Return a coloured emoji + label for a status string."""
     return {
-        "awaiting_reply": "⏳ Awaiting reply",
-        "completed":      "✅ Completed",
-        "no_replacement": "⚠️ No replacement",
-        "not_found":      "❌ Not found",
-        "ineligible":     "🚫 Ineligible",
-        "error":          "🔴 Error",
+        "replacement_found": "✅ Replacement found",
+        "awaiting_reply":    "⏳ Awaiting reply",
+        "completed":         "✅ Completed",
+        "no_replacement":    "⚠️ No replacement",
+        "not_found":         "❌ Not found",
+        "ineligible":        "🚫 Ineligible",
+        "error":             "🔴 Error",
     }.get(status, f"❓ {status}")
 
 
@@ -186,9 +187,6 @@ def main():
         st.success(f"✓ Loaded {len(schools)} schools")
         st.caption(f"API: `{config['base_url']}`")
 
-        st.divider()
-        st.markdown("**Need help?** See the [README](../README.md).")
-
     # ── Tabs ────────────────────────────────────────────────────────────────
     tab1, tab2 = st.tabs(["📋 Step 1 — Lookup", "✏️ Step 2 — Update"])
 
@@ -241,55 +239,162 @@ def main():
             output_dir = output_dir_input.strip() or output_dir_default
             email_dir  = os.path.join(output_dir, "emails")
 
-            with st.spinner("Looking up items in Alma…"):
-                log_lines = []
-                results   = None
-                pending_path = None
-                lookup_error = None
+            log_lines    = []
+            results      = None
+            pending_path = None
+            lookup_error = None
 
-                try:
+            # Progress bar lives outside the spinner so it can update in real time
+            progress_bar  = st.progress(0, text="Reading barcodes…")
+            status_text   = st.empty()
+
+            def _update_progress(current, total, barcode, status):
+                pct = current / total
+                progress_bar.progress(pct, text=f"[{current}/{total}]")
+                badge = _status_badge(status)
+                status_text.caption(f"Last: {barcode} → {badge}")
+
+            try:
+                with _capture_output() as out:
+                    items = read_barcodes(tmp_path)
+
+                if not items:
+                    lookup_error = "No items found in the uploaded file. Check the column names."
+                else:
+                    progress_bar.progress(0, text=f"Looking up {len(items)} items in Alma…")
+
                     with _capture_output() as out:
-                        items = read_barcodes(tmp_path)
+                        results = process_barcodes(items, schools, config,
+                                                   progress_callback=_update_progress)
+                    log_lines.append(out.getvalue())
 
-                    if not items:
-                        lookup_error = "No items found in the uploaded file. Check the column names."
-                    else:
-                        with _capture_output() as out:
-                            results = process_barcodes(items, schools, config)
-                        log_lines.append(out.getvalue())
+                    progress_bar.progress(1.0, text="Generating emails…")
+                    with _capture_output() as out:
+                        print_summary(results, schools)
+                    log_lines.append(out.getvalue())
 
-                        with _capture_output() as out:
-                            print_summary(results, schools)
-                        log_lines.append(out.getvalue())
+                    with _capture_output() as out:
+                        print_draft_emails(results, schools, email_dir)
+                    log_lines.append(out.getvalue())
 
-                        with _capture_output() as out:
-                            print_draft_emails(results, schools, email_dir)
-                        log_lines.append(out.getvalue())
+                    pending_path = save_pending_transfers(results, output_dir, schools)
+                    log_lines.append(f"\n✓ Pending file saved: {pending_path}\n")
 
-                        pending_path = save_pending_transfers(results, output_dir, schools)
-                        log_lines.append(f"\n✓ Pending file saved: {pending_path}\n")
+                    progress_bar.progress(1.0, text="Done!")
 
-                except _AppExit as e:
-                    lookup_error = str(e)
-                except Exception as e:
-                    lookup_error = f"Unexpected error: {e}"
-                finally:
-                    os.unlink(tmp_path)
+            except _AppExit as e:
+                lookup_error = str(e)
+            except Exception as e:
+                lookup_error = f"Unexpected error: {e}"
+            finally:
+                os.unlink(tmp_path)
 
             if lookup_error:
                 st.error(lookup_error)
             else:
-                # ── Results table ────────────────────────────────────────────
-                st.success(f"✓ Lookup complete — {len(results)} item(s) processed.")
+                # ── Summary banner ───────────────────────────────────────────
+                found     = [r for r in results if r["status"] == "replacement_found"]
+                no_repl   = [r for r in results if r["status"] == "no_replacement"]
+                not_found = [r for r in results if r["status"] == "not_found"]
+                ineligible = [r for r in results if r["status"] == "ineligible"]
+                errors    = [r for r in results if r["status"] == "error"]
 
+                st.success(f"✓ Lookup complete — {len(results)} item(s) processed, "
+                           f"{len(found)} replacement(s) found.")
+
+                # ── Replacements found ───────────────────────────────────────
+                if found:
+                    st.divider()
+                    st.subheader(f"✅ Replacement found ({len(found)})")
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "Barcode":     r.get("barcode", ""),
+                            "Title":       (r.get("title") or "")[:60],
+                            "Leaving":     _school_name(r.get("leaving_school"), schools),
+                            "Replacement": _school_name(r.get("replacement_school"), schools),
+                            "All holders": ", ".join(
+                                _school_name(c, schools)
+                                for c in r.get("holding_institutions", [])
+                            ),
+                        } for r in found]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                # ── Items skipped (wrong status) ──────────────────────────────
+                if ineligible:
+                    st.divider()
+                    st.subheader(f"🚫 Skipped — not in 'Item in place' status ({len(ineligible)})")
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "Barcode": r.get("barcode", ""),
+                            "Title":   (r.get("title") or "")[:60],
+                            "Status":  r.get("item_status", "unknown status"),
+                        } for r in ineligible]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                # ── Barcodes not found ────────────────────────────────────────
+                if not_found:
+                    st.divider()
+                    st.subheader(f"❌ Not found in Alma ({len(not_found)})")
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "Barcode": r.get("barcode", ""),
+                            "Leaving": _school_name(r.get("leaving_school"), schools),
+                            "Details": r.get("error", ""),
+                        } for r in not_found]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                # ── Errors ────────────────────────────────────────────────────
+                if errors:
+                    st.divider()
+                    st.subheader(f"🔴 Errors ({len(errors)})")
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "Barcode": r.get("barcode", ""),
+                            "Leaving": _school_name(r.get("leaving_school"), schools),
+                            "Error":   r.get("error", ""),
+                        } for r in errors]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                # ── No eligible replacement ───────────────────────────────────
+                if no_repl:
+                    st.divider()
+                    st.subheader(f"⚠️ No eligible replacement — flagged for withdrawal review ({len(no_repl)})")
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "Barcode": r.get("barcode", ""),
+                            "Title":   (r.get("title") or "Unknown")[:60],
+                            "Reason":  r.get("no_replacement_reason", ""),
+                        } for r in no_repl]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                # ── Full results table ────────────────────────────────────────
+                st.divider()
+                st.subheader(f"📋 All results ({len(results)})")
                 rows = []
                 for r in results:
+                    detail = (
+                        r.get("error")
+                        or r.get("item_status")
+                        or r.get("no_replacement_reason")
+                        or ""
+                    )
+                    if not detail:
+                        holders = r.get("holding_institutions", [])
+                        if holders:
+                            holder_names = [_school_name(c, schools) for c in holders]
+                            detail = f"Held by: {', '.join(holder_names)}"
                     rows.append({
                         "Barcode":     r.get("barcode", ""),
                         "Title":       (r.get("title") or "")[:60],
                         "Status":      _status_badge(r.get("status", "")),
                         "Leaving":     _school_name(r.get("leaving_school"), schools),
                         "Replacement": _school_name(r.get("replacement_school"), schools),
+                        "Details":     detail,
                     })
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 

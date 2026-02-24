@@ -75,8 +75,10 @@ The easiest way to use this tool is through the Streamlit web app:
 - The app will open in your browser automatically
 
 **Option B — Launch from terminal:**
+> **Important:** You must `cd` into the project folder first, or the app won't find its files.
+
 ```bash
-cd /path/to/library-retention
+cd /Users/kristenfredericksen/Library/CloudStorage/OneDrive-CUNY/agentic-projects/library-retention
 source venv/bin/activate
 streamlit run src/app.py
 ```
@@ -103,9 +105,9 @@ Create an Excel file with two columns:
 
 ### Running the Script
 
-> **Every time you open a new terminal**, activate the virtual environment first:
+> **Every time you open a new terminal**, `cd` to the project folder and activate the virtual environment:
 > ```bash
-> cd /path/to/library-retention
+> cd /Users/kristenfredericksen/Library/CloudStorage/OneDrive-CUNY/agentic-projects/library-retention
 > source venv/bin/activate
 > ```
 > You'll see `(venv)` at the start of your prompt when it's active.

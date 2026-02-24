@@ -400,23 +400,39 @@ def select_replacement_school(holding_institutions, leaving_school, schools):
 
     Returns: (selected_school_code, list_of_all_eligible_schools_in_priority_order)
     """
-    # Filter to only Shared Print participants who hold the item
+    # Filter to only Shared Print participants who hold the item,
+    # tracking why each non-eligible holder was excluded.
     eligible = []
+    only_leaving = True       # all holders are the leaving school
+    non_participant_names = [] # holders that aren't in Shared Print
+
     for inst_code in holding_institutions:
         if inst_code == leaving_school:
-            continue  # Skip the leaving school
+            continue
+
+        only_leaving = False  # at least one other school holds it
 
         if inst_code not in schools:
-            continue  # School not in our list
+            continue  # School not in our schools file
 
         school = schools[inst_code]
         if not school["shared_print"]:
-            continue  # Not a Shared Print participant
+            non_participant_names.append(school["name"])
+            continue
 
         eligible.append(school)
 
     if not eligible:
-        return None, []
+        # Build a human-readable reason for the caller / UI
+        if only_leaving and not non_participant_names:
+            reason = "No other CUNY school holds this item"
+        elif non_participant_names:
+            names = ", ".join(non_participant_names)
+            reason = (f"Held by {names}, but they are not Shared Print "
+                      f"participant(s)")
+        else:
+            reason = "No eligible Shared Print participants hold this item"
+        return None, [], reason
 
     # Check if Grad Center is in the eligible list
     grad_center_code = get_grad_center_code(schools)
@@ -426,12 +442,12 @@ def select_replacement_school(holding_institutions, leaving_school, schools):
             others = [s for s in eligible if s["code"] != grad_center_code]
             others.sort(key=lambda s: s["size"])  # 1 = largest, so ascending
             priority_list = [school] + others
-            return school["code"], [s["code"] for s in priority_list]
+            return school["code"], [s["code"] for s in priority_list], ""
 
     # No Grad Center - sort by size (1 = largest)
     eligible.sort(key=lambda s: s["size"])
 
-    return eligible[0]["code"], [s["code"] for s in eligible]
+    return eligible[0]["code"], [s["code"] for s in eligible], ""
 
 
 # =============================================================================
@@ -1738,7 +1754,7 @@ def read_barcodes(file_path):
     return items
 
 
-def process_barcodes(items, schools, config):
+def process_barcodes(items, schools, config, progress_callback=None):
     """
     Process each barcode: look up holdings and select replacement school.
 
@@ -1746,6 +1762,9 @@ def process_barcodes(items, schools, config):
         items: List of (barcode, school_code) tuples
         schools: Dictionary of school data
         config: Configuration dictionary
+        progress_callback: Optional function called after each item with
+                           (current_index, total, barcode, status_string).
+                           Used by the Streamlit app to update a progress bar.
 
     Returns a list of results for each barcode.
     """
@@ -1767,6 +1786,8 @@ def process_barcodes(items, schools, config):
                 "eligible_schools": [],
                 "error": f"Unknown school code: {leaving_school}"
             })
+            if progress_callback:
+                progress_callback(i, total, barcode, "error")
             continue
 
         leaving_school_name = schools[leaving_school]["name"]
@@ -1791,8 +1812,12 @@ def process_barcodes(items, schools, config):
                 "title": None,
                 "leaving_school": leaving_school,
                 "replacement_school": None,
-                "eligible_schools": []
+                "eligible_schools": [],
+                "error": f"Barcode not found via {leaving_school_name} API. "
+                         f"The item may have been deleted, or the barcode/school code may be incorrect."
             })
+            if progress_callback:
+                progress_callback(i, total, barcode, "not_found")
             continue
 
         # Check if item is ineligible due to status
@@ -1809,6 +1834,8 @@ def process_barcodes(items, schools, config):
                 "item_status": status_desc,
                 "bib_info": bib_info
             })
+            if progress_callback:
+                progress_callback(i, total, barcode, "ineligible")
             continue
 
         title = bib_info.get("title", "Unknown") if bib_info else "Unknown"
@@ -1816,12 +1843,12 @@ def process_barcodes(items, schools, config):
         print(f"  Held by: {len(institutions)} institution(s)")
 
         # Select replacement school
-        replacement, eligible_list = select_replacement_school(
+        replacement, eligible_list, no_replacement_reason = select_replacement_school(
             institutions, leaving_school, schools
         )
 
         if replacement is None:
-            print(f"  ⚠️  NO ELIGIBLE REPLACEMENT - Flag for withdrawal review")
+            print(f"  ⚠️  NO ELIGIBLE REPLACEMENT - {no_replacement_reason}")
             results.append({
                 "barcode": barcode,
                 "status": "no_replacement",
@@ -1829,6 +1856,8 @@ def process_barcodes(items, schools, config):
                 "leaving_school": leaving_school,
                 "replacement_school": None,
                 "eligible_schools": [],
+                "holding_institutions": institutions,
+                "no_replacement_reason": no_replacement_reason,
                 "bib_info": bib_info
             })
         else:
@@ -1841,8 +1870,13 @@ def process_barcodes(items, schools, config):
                 "leaving_school": leaving_school,
                 "replacement_school": replacement,
                 "eligible_schools": eligible_list,
+                "holding_institutions": institutions,
                 "bib_info": bib_info
             })
+
+        # Notify caller of progress (used by Streamlit for the progress bar)
+        if progress_callback:
+            progress_callback(i, total, barcode, results[-1]["status"])
 
     return results
 
