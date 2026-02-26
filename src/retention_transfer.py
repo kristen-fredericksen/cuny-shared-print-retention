@@ -382,6 +382,16 @@ def find_holding_institutions(barcode, leaving_school, schools, config):
         "item_data": item_data
     }
 
+    # Step 4: Verify the leaving school actually holds this item.
+    # If it's not in the NZ holdings list, the barcode/school pairing
+    # in the spreadsheet is wrong — flag it rather than silently proceeding.
+    if institutions is not None and leaving_school not in institutions:
+        print(f"  ⚠️  MISMATCH: {leaving_school} is listed as the leaving school "
+              f"but does not appear in the NZ holdings for this item.")
+        print(f"  Actual holders: {institutions}")
+        bib_info["actual_holders"] = institutions
+        return "mismatch", bib_info
+
     return institutions, bib_info
 
 
@@ -1804,6 +1814,32 @@ def process_barcodes(items, schools, config, progress_callback=None):
             barcode, leaving_school, schools, config
         )
 
+        # Barcode/school mismatch — the item exists but the leaving school
+        # listed in the spreadsheet doesn't actually hold it
+        if institutions == "mismatch":
+            actual_holders = bib_info.get("actual_holders", []) if bib_info else []
+            holder_names = ", ".join(
+                schools.get(c, {}).get("name", c) for c in actual_holders
+            ) or "unknown"
+            title = bib_info.get("title", "Unknown") if bib_info else "Unknown"
+            results.append({
+                "barcode": barcode,
+                "status": "error",
+                "title": title,
+                "leaving_school": leaving_school,
+                "replacement_school": None,
+                "eligible_schools": [],
+                "error": (
+                    f"{leaving_school_name} is listed as the leaving school "
+                    f"but does not hold this item in the Network Zone. "
+                    f"Check that the school code in the spreadsheet is correct."
+                ),
+                "bib_info": bib_info,
+            })
+            if progress_callback:
+                progress_callback(i, total, barcode, "error")
+            continue
+
         if institutions is None:
             print(f"  NOT FOUND in Alma")
             results.append({
@@ -2411,6 +2447,90 @@ def run_update_phase(json_path, output_dir, config, schools):
         print(f"  ✓ Transfer complete.")
 
     # -------------------------------------------------------------------------
+    # No-replacement items: offer to remove the leaving school's commitment
+    # -------------------------------------------------------------------------
+    no_replacement_items = [it for it in items if it["status"] == "no_replacement"]
+    if no_replacement_items:
+        print(f"\n{'─' * 60}")
+        print(f"NO-REPLACEMENT ITEMS ({len(no_replacement_items)})")
+        print(f"{'─' * 60}")
+        print("The following items have no eligible replacement school.")
+        print("The leaving school's retention commitment can still be removed")
+        print("even though no other school is taking it on.\n")
+        for it in no_replacement_items:
+            leaving_code = it.get("leaving_school", "")
+            leaving_name = schools.get(leaving_code, {}).get("name", leaving_code)
+            print(f"  {it['barcode']}  {(it.get('title') or '')[:50]}")
+            print(f"  Leaving: {leaving_name}")
+
+        answer = ""
+        while answer not in ("yes", "no"):
+            answer = input(
+                f"\nRemove retention commitments from the leaving school's "
+                f"Alma records for these {len(no_replacement_items)} item(s)? (yes/no): "
+            ).strip().lower()
+            if answer not in ("yes", "no"):
+                print("  Please type 'yes' or 'no'.")
+
+        if answer == "yes":
+            for item_entry in no_replacement_items:
+                barcode      = item_entry.get("barcode", "?")
+                leaving_code = item_entry.get("leaving_school", "")
+                title        = item_entry.get("title", "Unknown")
+
+                print(f"\n  Processing {barcode} — {title[:50]}")
+
+                # Re-verify leaving school IDs before making changes
+                l_mms_id, l_holding_id, l_item_pid, warn = _re_verify_leaving_school_ids(
+                    item_entry, schools, config
+                )
+                if l_mms_id is None:
+                    print(f"  ✗ Could not verify leaving school IDs: {warn}")
+                    errors.append({"barcode": barcode, "message": warn})
+                    continue
+                if warn:
+                    print(f"  ⚠️  IDs changed since lookup: {warn}")
+
+                leaving_school = schools.get(leaving_code, {})
+                l_api_key      = leaving_school.get("api_key", "")
+
+                item_ok, item_msg = update_leaving_school_item(
+                    l_mms_id, l_holding_id, l_item_pid, l_api_key, config["base_url"]
+                )
+                if item_ok:
+                    print(f"  ✓ Leaving school item: {item_msg}")
+                else:
+                    print(f"  ✗ Leaving school item update failed: {item_msg}")
+                    errors.append({"barcode": barcode, "message": item_msg})
+                    continue
+
+                _, holdings_msg = update_leaving_school_holdings(
+                    l_mms_id, l_holding_id, l_item_pid, l_api_key, config["base_url"]
+                )
+                print(f"  ✓ Leaving school holdings: {holdings_msg}")
+
+                # WorldCat leaving instructions (no taking school CSV)
+                worldcat_result = {
+                    "status":             "replacement_found",
+                    "barcode":            barcode,
+                    "title":              title,
+                    "replacement_school": None,
+                    "leaving_school":     leaving_code,
+                    "bib_info":           item_entry.get("bib_info"),
+                }
+                wc_instructions = generate_worldcat_leaving_instructions(
+                    [worldcat_result], schools, worldcat_dir
+                )
+                if wc_instructions:
+                    print(f"  ✓ WorldCat leaving instructions: {wc_instructions}")
+
+                item_entry["status"]         = "commitment_removed"
+                item_entry["completed_date"] = datetime.now().isoformat()
+                print(f"  ✓ Commitment removed.")
+        else:
+            print("  Skipping — commitments left in place.")
+
+    # -------------------------------------------------------------------------
     # Save updated pending file
     # -------------------------------------------------------------------------
     with open(json_path, "w", encoding="utf-8") as f:
@@ -2451,12 +2571,13 @@ def _print_update_summary(items, schools):
         by_status.setdefault(s, []).append(it)
 
     status_labels = {
-        "completed":      "✓ Completed",
-        "awaiting_reply": "⏳ Awaiting reply",
-        "no_replacement": "⚠️  No replacement (withdrawal review)",
-        "not_found":      "✗ Not found in Alma",
-        "ineligible":     "✗ Ineligible (item not in place)",
-        "error":          "✗ Error",
+        "completed":           "✓ Completed (transferred)",
+        "commitment_removed":  "✓ Commitment removed (no replacement)",
+        "awaiting_reply":      "⏳ Awaiting reply",
+        "no_replacement":      "⚠️  No replacement (withdrawal review)",
+        "not_found":           "✗ Not found in Alma",
+        "ineligible":          "✗ Ineligible (item not in place)",
+        "error":               "✗ Error",
     }
     for status, label in status_labels.items():
         group = by_status.get(status, [])

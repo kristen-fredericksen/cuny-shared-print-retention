@@ -111,13 +111,14 @@ def _read_file_bytes(path: str) -> bytes:
 def _status_badge(status: str) -> str:
     """Return a coloured emoji + label for a status string."""
     return {
-        "replacement_found": "✅ Replacement found",
-        "awaiting_reply":    "⏳ Awaiting reply",
-        "completed":         "✅ Completed",
-        "no_replacement":    "⚠️ No replacement",
-        "not_found":         "❌ Not found",
-        "ineligible":        "🚫 Ineligible",
-        "error":             "🔴 Error",
+        "replacement_found":  "✅ Replacement found",
+        "awaiting_reply":     "⏳ Awaiting reply",
+        "completed":          "✅ Completed (transferred)",
+        "commitment_removed": "✅ Commitment removed",
+        "no_replacement":     "⚠️ No replacement",
+        "not_found":          "❌ Not found",
+        "ineligible":         "🚫 Ineligible",
+        "error":              "🔴 Error",
     }.get(status, f"❓ {status}")
 
 
@@ -352,9 +353,14 @@ def main():
                     st.subheader(f"🔴 Errors ({len(errors)})")
                     st.dataframe(
                         pd.DataFrame([{
-                            "Barcode": r.get("barcode", ""),
-                            "Leaving": _school_name(r.get("leaving_school"), schools),
-                            "Error":   r.get("error", ""),
+                            "Barcode":        r.get("barcode", ""),
+                            "Title":          (r.get("title") or "")[:60],
+                            "Listed as":      _school_name(r.get("leaving_school"), schools),
+                            "Actual holders": ", ".join(
+                                _school_name(c, schools)
+                                for c in (r.get("bib_info") or {}).get("actual_holders", [])
+                            ) or "",
+                            "Error":          r.get("error", ""),
                         } for r in errors]),
                         use_container_width=True, hide_index=True,
                     )
@@ -529,7 +535,8 @@ def main():
                 st.subheader(f"⏳ Items awaiting a reply ({len(awaiting)})")
                 st.markdown(
                     "For each item below, choose whether the proposed school "
-                    "**agreed**, **declined**, or you want to **skip** for now."
+                    "**agreed** or **declined**. Items with no selection will be "
+                    "left pending and included next time you run Step 2."
                 )
 
                 # Output dir for this update run
@@ -545,11 +552,61 @@ def main():
                 )
 
                 # ── Per-item decision widgets ────────────────────────────────
-                # We store decisions in session state so they survive reruns
-                if "item_decisions" not in st.session_state:
-                    st.session_state["item_decisions"] = {}
+                # Each radio widget stores its value in st.session_state under
+                # the key "decision_{barcode}". Bulk actions write to the same
+                # keys so there is only one source of truth.
 
-                decisions = st.session_state["item_decisions"]
+                _OPTIONS = ["(not yet decided)", "✅ Yes — agreed", "❌ No — declined"]
+
+                def _set_decision(barcode, value):
+                    st.session_state[f"decision_{barcode}"] = value
+
+                def _get_decision(barcode):
+                    return st.session_state.get(f"decision_{barcode}", "(not yet decided)")
+
+                # ── Bulk actions ─────────────────────────────────────────────
+                with st.expander("🔀 Bulk actions", expanded=False):
+                    st.caption("These buttons override individual selections below.")
+
+                    # Mark all
+                    ba_cols = st.columns(2)
+                    if ba_cols[0].button("✅ Mark all Yes", use_container_width=True):
+                        for it in awaiting:
+                            _set_decision(it.get("barcode", "?"), "✅ Yes — agreed")
+                        st.rerun()
+                    if ba_cols[1].button("❌ Mark all No", use_container_width=True):
+                        for it in awaiting:
+                            _set_decision(it.get("barcode", "?"), "❌ No — declined")
+                        st.rerun()
+
+                    st.divider()
+
+                    # Mark all for a specific proposed school
+                    proposed_schools = sorted(set(
+                        it.get("proposed_school", "") for it in awaiting
+                        if it.get("proposed_school")
+                    ))
+                    if proposed_schools:
+                        school_options = {
+                            _school_name(c, schools): c for c in proposed_schools
+                        }
+                        selected_school_name = st.selectbox(
+                            "Mark all items proposed to…",
+                            options=list(school_options.keys()),
+                            key="bulk_school_select",
+                        )
+                        selected_code = school_options[selected_school_name]
+                        sc_cols = st.columns(2)
+                        if sc_cols[0].button(f"✅ Yes for {selected_school_name}", use_container_width=True):
+                            for it in awaiting:
+                                if it.get("proposed_school") == selected_code:
+                                    _set_decision(it.get("barcode", "?"), "✅ Yes — agreed")
+                            st.rerun()
+                        if sc_cols[1].button(f"❌ No for {selected_school_name}", use_container_width=True):
+                            for it in awaiting:
+                                if it.get("proposed_school") == selected_code:
+                                    _set_decision(it.get("barcode", "?"), "❌ No — declined")
+                            st.rerun()
 
                 for it in awaiting:
                     barcode      = it.get("barcode", "?")
@@ -573,11 +630,10 @@ def main():
                                 )
                                 st.caption(f"Previously declined: {declined_names}")
                         with c2:
-                            key = f"decision_{barcode}"
-                            decisions[barcode] = st.radio(
+                            st.radio(
                                 "Reply",
-                                options=["(not yet decided)", "✅ Yes — agreed", "❌ No — declined", "⏭ Skip for now"],
-                                key=key,
+                                options=_OPTIONS,
+                                key=f"decision_{barcode}",
                                 label_visibility="collapsed",
                             )
 
@@ -585,8 +641,9 @@ def main():
                 st.divider()
 
                 ready_count = sum(
-                    1 for v in decisions.values()
-                    if v in ("✅ Yes — agreed", "❌ No — declined")
+                    1 for it in awaiting
+                    if _get_decision(it.get("barcode", "?"))
+                    in ("✅ Yes — agreed", "❌ No — declined")
                 )
 
                 run_update = st.button(
@@ -612,14 +669,14 @@ def main():
 
                     for idx, it in enumerate(awaiting):
                         barcode  = it.get("barcode", "?")
-                        decision = decisions.get(barcode, "(not yet decided)")
+                        decision = _get_decision(barcode)
                         total    = len(awaiting)
 
                         progress.progress((idx) / total, text=f"Processing {barcode}…")
 
-                        if decision == "(not yet decided)" or decision == "⏭ Skip for now":
+                        if decision == "(not yet decided)":
                             n_skipped += 1
-                            update_log.append(f"[{barcode}] Skipped.")
+                            update_log.append(f"[{barcode}] No decision — left pending.")
                             continue
 
                         if decision == "❌ No — declined":
@@ -810,46 +867,139 @@ def main():
 
         # ── Completed / no-replacement summary (always shown if payload loaded) ──
         if pending_payload is not None:
-            completed_items = [it for it in items if it["status"] == "completed"]
-            no_replace_items = [it for it in items if it["status"] == "no_replacement"]
+            completed_items     = [it for it in items if it["status"] == "completed"]
+            removed_items       = [it for it in items if it["status"] == "commitment_removed"]
+            no_replace_items    = [it for it in items if it["status"] == "no_replacement"]
 
-            if completed_items or no_replace_items:
-                st.divider()
-                if completed_items:
-                    with st.expander(f"✅ Completed transfers ({len(completed_items)})", expanded=False):
-                        rows = []
-                        for it in completed_items:
-                            rows.append({
-                                "Barcode":       it.get("barcode", ""),
-                                "Title":         (it.get("title") or "")[:60],
-                                "From":          _school_name(it.get("leaving_school"), schools),
-                                "To":            _school_name(it.get("taking_school"), schools),
-                                "Completed":     (it.get("completed_date") or "")[:10],
-                            })
-                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.divider()
 
-                if no_replace_items:
-                    with st.expander(
-                        f"⚠️ Items needing withdrawal review ({len(no_replace_items)})",
-                        expanded=True,
-                    ):
-                        st.warning(
-                            "All eligible replacement schools have declined these items.  "
-                            "They need manual review to decide whether to withdraw them from "
-                            "the Shared Print program."
+            # ── Completed transfers ───────────────────────────────────────────
+            if completed_items:
+                with st.expander(f"✅ Completed transfers ({len(completed_items)})", expanded=False):
+                    st.dataframe(pd.DataFrame([{
+                        "Barcode":   it.get("barcode", ""),
+                        "Title":     (it.get("title") or "")[:60],
+                        "From":      _school_name(it.get("leaving_school"), schools),
+                        "To":        _school_name(it.get("taking_school"), schools),
+                        "Completed": (it.get("completed_date") or "")[:10],
+                    } for it in completed_items]), use_container_width=True, hide_index=True)
+
+            # ── Commitments removed (no replacement) ─────────────────────────
+            if removed_items:
+                with st.expander(f"✅ Commitments removed — no replacement ({len(removed_items)})", expanded=False):
+                    st.dataframe(pd.DataFrame([{
+                        "Barcode":   it.get("barcode", ""),
+                        "Title":     (it.get("title") or "")[:60],
+                        "Leaving":   _school_name(it.get("leaving_school"), schools),
+                        "Completed": (it.get("completed_date") or "")[:10],
+                    } for it in removed_items]), use_container_width=True, hide_index=True)
+
+            # ── No replacement — ask whether to remove commitment ─────────────
+            if no_replace_items:
+                with st.expander(
+                    f"⚠️ No eligible replacement — action needed ({len(no_replace_items)})",
+                    expanded=True,
+                ):
+                    st.warning(
+                        "No eligible replacement school was found for these items. "
+                        "You can still remove the leaving school's retention commitment "
+                        "from Alma even though no other school is taking it on."
+                    )
+                    st.dataframe(pd.DataFrame([{
+                        "Barcode":  it.get("barcode", ""),
+                        "Title":    (it.get("title") or "")[:60],
+                        "Leaving":  _school_name(it.get("leaving_school"), schools),
+                        "Declined": ", ".join(
+                            _school_name(s, schools)
+                            for s in it.get("declined_schools", [])
+                        ),
+                    } for it in no_replace_items]), use_container_width=True, hide_index=True)
+
+                    st.markdown("**Remove retention commitments from the leaving school's Alma records?**")
+                    remove_confirm = st.button(
+                        f"🗑️ Remove commitments for {len(no_replace_items)} item(s)",
+                        key="remove_no_replacement",
+                    )
+
+                    if remove_confirm:
+                        output_dir = (
+                            st.session_state.get("update_output_dir", "")
+                            or str(_ROOT / "output")
                         )
-                        rows = []
-                        for it in no_replace_items:
-                            rows.append({
-                                "Barcode":  it.get("barcode", ""),
-                                "Title":    (it.get("title") or "")[:60],
-                                "Leaving":  _school_name(it.get("leaving_school"), schools),
-                                "Declined": ", ".join(
-                                    _school_name(s, schools)
-                                    for s in it.get("declined_schools", [])
-                                ),
-                            })
-                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                        remove_log = []
+                        n_removed  = 0
+                        n_errors   = 0
+
+                        prog = st.progress(0, text="Removing commitments…")
+                        total_nr = len(no_replace_items)
+
+                        for idx, item_entry in enumerate(no_replace_items):
+                            barcode      = item_entry.get("barcode", "?")
+                            leaving_code = item_entry.get("leaving_school", "")
+                            title        = item_entry.get("title", "Unknown")
+
+                            prog.progress(idx / total_nr, text=f"[{idx+1}/{total_nr}]")
+
+                            l_mms_id, l_holding_id, l_item_pid, warn = _re_verify_leaving_school_ids(
+                                item_entry, schools, config
+                            )
+                            if l_mms_id is None:
+                                n_errors += 1
+                                remove_log.append(f"[{barcode}] ✗ Could not verify IDs: {warn}")
+                                continue
+                            if warn:
+                                remove_log.append(f"[{barcode}] ⚠ IDs changed: {warn}")
+
+                            leaving_school = schools.get(leaving_code, {})
+                            l_api_key      = leaving_school.get("api_key", "")
+
+                            item_ok, item_msg = update_leaving_school_item(
+                                l_mms_id, l_holding_id, l_item_pid, l_api_key, config["base_url"]
+                            )
+                            if item_ok:
+                                remove_log.append(f"[{barcode}] ✓ Item: {item_msg}")
+                            else:
+                                n_errors += 1
+                                remove_log.append(f"[{barcode}] ✗ Item failed: {item_msg}")
+                                continue
+
+                            _, holdings_msg = update_leaving_school_holdings(
+                                l_mms_id, l_holding_id, l_item_pid, l_api_key, config["base_url"]
+                            )
+                            remove_log.append(f"[{barcode}] ✓ Holdings: {holdings_msg}")
+
+                            worldcat_result = {
+                                "status":             "replacement_found",
+                                "barcode":            barcode,
+                                "title":              title,
+                                "replacement_school": None,
+                                "leaving_school":     leaving_code,
+                                "bib_info":           item_entry.get("bib_info"),
+                            }
+                            wc_instr = generate_worldcat_leaving_instructions(
+                                [worldcat_result], schools, output_dir
+                            )
+                            if wc_instr:
+                                remove_log.append(f"[{barcode}] ✓ WorldCat instructions: {wc_instr}")
+
+                            item_entry["status"]         = "commitment_removed"
+                            item_entry["completed_date"] = datetime.now().isoformat()
+                            n_removed += 1
+
+                        prog.progress(1.0, text="Done!")
+
+                        # Save updated pending file
+                        if pending_json_path:
+                            with open(pending_json_path, "w", encoding="utf-8") as f:
+                                json.dump(pending_payload, f, indent=2, default=str)
+
+                        st.success(f"✓ {n_removed} commitment(s) removed.  "
+                                   + (f"🔴 {n_errors} error(s)." if n_errors else ""))
+
+                        with st.expander("📜 Log", expanded=False):
+                            st.code("\n".join(remove_log), language=None)
+
+                        st.rerun()
 
 
 if __name__ == "__main__":
