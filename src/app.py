@@ -993,13 +993,23 @@ def main():
                             with open(pending_json_path, "w", encoding="utf-8") as f:
                                 json.dump(pending_payload, f, indent=2, default=str)
 
-                        st.success(f"✓ {n_removed} commitment(s) removed.  "
-                                   + (f"🔴 {n_errors} error(s)." if n_errors else ""))
+                        # Store results in session state so they survive reruns
+                        st.session_state["remove_result"] = {
+                            "n_removed": n_removed,
+                            "n_errors":  n_errors,
+                            "log":       remove_log,
+                        }
 
-                        with st.expander("📜 Log", expanded=False):
-                            st.code("\n".join(remove_log), language=None)
-
-                        st.rerun()
+                    # Show results if we have them (persists across reruns)
+                    if "remove_result" in st.session_state:
+                        r = st.session_state["remove_result"]
+                        if r["n_errors"]:
+                            st.warning(f"✓ {r['n_removed']} commitment(s) removed — "
+                                       f"🔴 {r['n_errors']} error(s).")
+                        else:
+                            st.success(f"✓ {r['n_removed']} commitment(s) removed successfully.")
+                        with st.expander("📜 Log", expanded=True):
+                            st.code("\n".join(r["log"]), language=None)
 
 
 if __name__ == "__main__":
