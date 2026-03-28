@@ -27,7 +27,6 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 # Redirect sys.exit to a Streamlit-friendly exception so the app never crashes
-import builtins as _builtins
 
 class _AppExit(Exception):
     pass
@@ -47,7 +46,6 @@ try:
         print_summary,
         print_draft_emails,
         save_pending_transfers,
-        load_pending_transfers,
         _handle_decline,
         _re_verify_leaving_school_ids,
         _re_verify_taking_school_ids,
@@ -66,7 +64,7 @@ except Exception as _e:
 finally:
     sys.exit = _real_exit  # restore
 
-import pandas as pd
+import pandas as pd  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -131,8 +129,8 @@ def _school_name(code: str | None, schools: dict) -> str:
 # ---------------------------------------------------------------------------
 # Capture stdout so we can display it inside the app
 # ---------------------------------------------------------------------------
-import contextlib
-import io as _io
+import contextlib  # noqa: E402
+import io as _io  # noqa: E402
 
 @contextlib.contextmanager
 def _capture_output():
@@ -175,7 +173,7 @@ def main():
             try:
                 with _capture_output() as out:
                     config  = get_config(sandbox=sandbox)
-                    schools = load_schools(config["schools_file"])
+                    schools = load_schools(config["schools_file"], sandbox=sandbox)
                 st.session_state[cache_key] = (config, schools)
                 _env_log = out.getvalue()
             except _AppExit as e:
@@ -418,7 +416,7 @@ def main():
                                 file_name=os.path.basename(pending_path),
                                 mime="application/json",
                             )
-                        st.caption(f"Save this file — you'll need it for Step 2.")
+                        st.caption("Save this file — you'll need it for Step 2.")
 
                 # Draft emails zip
                 with col2:
@@ -665,7 +663,7 @@ def main():
                     new_emails  = []
 
                     progress = st.progress(0, text="Applying decisions…")
-                    status_area = st.empty()
+                    st.empty()  # placeholder for future status messages
 
                     for idx, it in enumerate(awaiting):
                         barcode  = it.get("barcode", "?")
@@ -781,7 +779,7 @@ def main():
                         it["completed_date"] = datetime.now().isoformat()
                         it["taking_school"]  = taking_code
                         n_completed += 1
-                        update_log.append(f"  ✅ Transfer complete.")
+                        update_log.append("  ✅ Transfer complete.")
 
                     progress.progress(1.0, text="Done!")
 

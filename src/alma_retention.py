@@ -171,7 +171,7 @@ def update_item_retention(item_data, retention_reason, api_key, base_url):
                 if "errorList" in error_info:
                     for error in error_info["errorList"]["error"]:
                         print(f"    - {error.get('errorMessage', 'Unknown error')}")
-            except:
+            except Exception:
                 pass
             return False
 

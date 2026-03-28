@@ -51,19 +51,20 @@ cp .env.example .env
 
 ### Configuration
 
-1. **`.env` file** - Contains your Network Zone API key:
-   ```
-   ALMA_NZ_API_KEY=your_network_zone_key
-   ALMA_API_BASE_URL=https://api-na.hosted.exlibrisgroup.com
-   SCHOOLS_FILE=data/schools_template.csv
-   ```
+1. **`.env` file** - Contains all API keys. See `.env.example` for the full format:
+   - Network Zone key (`ALMA_NZ_API_KEY`)
+   - Per-campus keys for each Shared Print school (`ALMA_PROD_{campus}`)
+   - Sandbox equivalents if needed (`ALMA_SANDBOX_NZ_API_KEY`, `ALMA_SANDBOX_{campus}`)
 
-2. **`data/schools_template.csv`** - Contains school information:
+   The campus code is the part after `01CUNY_` in the Alma Institution Code — for example, `01CUNY_QC` → `ALMA_PROD_QC`.
+
+2. **`data/schools_template.csv`** - Contains school metadata (no API keys):
    - Name, Size (1=largest), Shared Print (Yes/No)
    - Alma Institution Code, OCLC Symbol, MARC Org Code, Primo View ID
    - Chief Librarian Name and Email
-   - Alma API Key (for each school)
    - OCLC Collection ID (7-digit data sync collection ID; required for Phase 5 WorldCat CSV generation)
+
+   A sample file showing the expected format (with placeholder data) is committed as `schools_sample.csv`.
 
 ## Web App (Recommended)
 
@@ -180,7 +181,9 @@ After that, just type `retention` in any terminal window to navigate to the proj
 
 The following files contain sensitive data and are excluded from git:
 - `.env` (API keys)
-- `data/` folder (school information and barcode files)
+- `data/` folder (school information including librarian contacts, and barcode files)
+
+`schools_sample.csv` (project root) is committed as a format reference with placeholder data.
 
 ## License
 

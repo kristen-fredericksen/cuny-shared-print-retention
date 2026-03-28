@@ -121,9 +121,13 @@ def _clean_oclc_collection_id(raw):
         return cleaned
 
 
-def load_schools(file_path):
+def load_schools(file_path, sandbox=False):
     """
     Load the schools data from CSV file.
+
+    API keys are read from environment variables (ALMA_PROD_{campus} or
+    ALMA_SANDBOX_{campus}), where campus is the suffix after '01CUNY_' in
+    the Alma Institution Code (e.g. '01CUNY_QC' -> 'QC').
 
     Returns a dictionary keyed by Alma Institution Code.
     """
@@ -134,9 +138,12 @@ def load_schools(file_path):
         print("Please create this file with columns: Name, Size, Shared Print, Alma Institution Code, etc.")
         sys.exit(1)
 
+    prefix = "ALMA_SANDBOX" if sandbox else "ALMA_PROD"
     schools = {}
     for _, row in df.iterrows():
         code = row["Alma Institution Code"]
+        campus = code.replace("01CUNY_", "")
+        api_key = os.getenv(f"{prefix}_{campus}", "")
         schools[code] = {
             "name": row["Name"],
             "size": row["Size"],  # 1 = largest
@@ -147,7 +154,7 @@ def load_schools(file_path):
             "chief_librarian_name": row.get("Chief Librarian Name", ""),
             "chief_librarian_email": row.get("Chief Librarian Email", ""),
             "marc_org_code": row.get("MARC Org Code", ""),
-            "api_key": row.get("Alma API Key", ""),
+            "api_key": api_key,
             "oclc_collection_id": _clean_oclc_collection_id(row.get("OCLC Collection ID", ""))
         }
 
@@ -1065,7 +1072,7 @@ def build_583_field(marc_org_code):
     """
     # Build subfields
     subfields = [
-        f'<subfield code="a">Committed to retain</subfield>',
+        '<subfield code="a">Committed to retain</subfield>',
         f'<subfield code="c">{RETENTION_583_START_DATE}</subfield>',
         f'<subfield code="d">{RETENTION_583_END_DATE}</subfield>',
         f'<subfield code="f">{RETENTION_583_ORG_NAME}</subfield>',
@@ -1400,14 +1407,11 @@ def build_worldcat_row_taking(result, taking_school):
         List of values matching WORLDCAT_CSV_HEADERS order, or None if missing
         required data (OCLC number).
     """
-    from datetime import datetime
-
     item_data = result.get("bib_info", {}).get("item_data", {})
     oclc_number = get_oclc_number_from_item(item_data)
     barcode = result.get("barcode", "")
     oclc_symbol = taking_school.get("oclc_symbol", "")
     collection_id = taking_school.get("oclc_collection_id", "")
-    action_date = datetime.now().strftime("%Y%m%d")
 
     # OCLC number is required — without it the row cannot be processed
     if not oclc_number:
@@ -1817,10 +1821,6 @@ def process_barcodes(items, schools, config, progress_callback=None):
         # Barcode/school mismatch — the item exists but the leaving school
         # listed in the spreadsheet doesn't actually hold it
         if institutions == "mismatch":
-            actual_holders = bib_info.get("actual_holders", []) if bib_info else []
-            holder_names = ", ".join(
-                schools.get(c, {}).get("name", c) for c in actual_holders
-            ) or "unknown"
             title = bib_info.get("title", "Unknown") if bib_info else "Unknown"
             results.append({
                 "barcode": barcode,
@@ -1841,7 +1841,7 @@ def process_barcodes(items, schools, config, progress_callback=None):
             continue
 
         if institutions is None:
-            print(f"  NOT FOUND in Alma")
+            print("  NOT FOUND in Alma")
             results.append({
                 "barcode": barcode,
                 "status": "not_found",
@@ -2102,12 +2102,12 @@ def run_lookup_phase(barcode_file, output_dir, config, schools):
         print("NEXT STEPS")
         print("=" * 60)
         print(f"  1. Open and send the draft email(s) in: {email_dir}/")
-        print(f"  2. Wait for replies from the chief librarians.")
-        print(f"  3. When you have a reply, run:")
-        print(f"\n     python retention_transfer.py \\")
+        print("  2. Wait for replies from the chief librarians.")
+        print("  3. When you have a reply, run:")
+        print("\n     python retention_transfer.py \\")
         print(f"         {pending_path} --update")
         if config.get("sandbox"):
-            print(f"         --sandbox")
+            print("         --sandbox")
         print()
     else:
         print("\nNo actionable items found (no replacements to email).")
@@ -2322,7 +2322,7 @@ def run_update_phase(json_path, output_dir, config, schools):
                 print("  Please type 'yes', 'no', or 'skip'.")
 
         if answer == "skip":
-            print(f"  Skipping — will try again next run.")
+            print("  Skipping — will try again next run.")
             skipped.append(barcode)
             continue
 
@@ -2341,12 +2341,12 @@ def run_update_phase(json_path, output_dir, config, schools):
         )
         if l_mms_id is None:
             print(f"  ✗ Could not verify leaving school IDs: {warn}")
-            print(f"    Skipping this item — no changes made.")
+            print("    Skipping this item — no changes made.")
             errors.append({"barcode": barcode, "message": warn})
             continue
         if warn:
             print(f"  ⚠️  Leaving school IDs changed since lookup: {warn}")
-            print(f"    Using updated IDs.")
+            print("    Using updated IDs.")
 
         # Re-verify taking school IDs
         t_iz_mms_id, t_holding_id, t_item_pid, err = _re_verify_taking_school_ids(
@@ -2357,11 +2357,11 @@ def run_update_phase(json_path, output_dir, config, schools):
                 print(f"  ⚠️  Taking school needs manual review: {err[len('NEEDS_REVIEW:'):].strip()}")
             else:
                 print(f"  ✗ Could not verify taking school IDs: {err}")
-            print(f"    Skipping this item — no changes made.")
+            print("    Skipping this item — no changes made.")
             errors.append({"barcode": barcode, "message": err})
             continue
 
-        print(f"  IDs verified. Proceeding with updates...")
+        print("  IDs verified. Proceeding with updates...")
 
         # Phase 3: Update leaving school
         leaving_school  = schools[leaving_code]
@@ -2444,7 +2444,7 @@ def run_update_phase(json_path, output_dir, config, schools):
         item_entry["completed_date"] = datetime.now().isoformat()
         item_entry["taking_school"]  = taking_code
         newly_completed.append(barcode)
-        print(f"  ✓ Transfer complete.")
+        print("  ✓ Transfer complete.")
 
     # -------------------------------------------------------------------------
     # No-replacement items: offer to remove the leaving school's commitment
@@ -2526,7 +2526,7 @@ def run_update_phase(json_path, output_dir, config, schools):
 
                 item_entry["status"]         = "commitment_removed"
                 item_entry["completed_date"] = datetime.now().isoformat()
-                print(f"  ✓ Commitment removed.")
+                print("  ✓ Commitment removed.")
         else:
             print("  Skipping — commitments left in place.")
 
@@ -2547,11 +2547,11 @@ def run_update_phase(json_path, output_dir, config, schools):
     if still_awaiting:
         print(f"\n  {len(still_awaiting)} item(s) still awaiting a reply.")
         print(f"  New draft emails (if any) were saved to: {email_dir}/")
-        print(f"  When you have more replies, run:")
-        print(f"\n     python retention_transfer.py \\")
+        print("  When you have more replies, run:")
+        print("\n     python retention_transfer.py \\")
         print(f"         {json_path} --update")
         if config.get("sandbox"):
-            print(f"         --sandbox")
+            print("         --sandbox")
 
     if errors:
         print(f"\n  ⚠️  {len(errors)} item(s) had errors and were NOT updated:")
@@ -2628,23 +2628,23 @@ def main():
         print("⚠️  SANDBOX MODE")
     print(f"API Base URL: {config['base_url']}")
 
-    schools = load_schools(config["schools_file"])
+    schools = load_schools(config["schools_file"], sandbox=sandbox)
     print(f"Loaded {len(schools)} schools")
 
     if update:
         # ── UPDATE MODE: first arg must be a .json pending-transfers file ──
         if not input_file.endswith(".json"):
-            print(f"ERROR: --update requires a pending-transfers JSON file as the first argument.")
+            print("ERROR: --update requires a pending-transfers JSON file as the first argument.")
             print(f"  Got: {input_file}")
-            print(f"  Example: python retention_transfer.py output/pending_20260220_143012.json --update")
+            print("  Example: python retention_transfer.py output/pending_20260220_143012.json --update")
             sys.exit(1)
         run_update_phase(input_file, output_dir, config, schools)
     else:
         # ── LOOKUP MODE: first arg must be an Excel file ──
         if not (input_file.endswith(".xlsx") or input_file.endswith(".xls")):
-            print(f"ERROR: Lookup mode requires an Excel (.xlsx) file as the first argument.")
+            print("ERROR: Lookup mode requires an Excel (.xlsx) file as the first argument.")
             print(f"  Got: {input_file}")
-            print(f"  To run updates on an existing pending file, add --update.")
+            print("  To run updates on an existing pending file, add --update.")
             sys.exit(1)
         run_lookup_phase(input_file, output_dir, config, schools)
 

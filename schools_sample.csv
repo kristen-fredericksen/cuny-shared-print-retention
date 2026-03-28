@@ -1,0 +1,4 @@
+Name,Size,Shared Print,Alma Institution Code,OCLC Symbol,MARC Org Code,Primo View ID,Chief Librarian Name,Chief Librarian Email,OCLC Collection ID
+Example College A,1,Yes,01CUNY_XX,XXX,NXXX,abc123,Jane Smith,jsmith@exampleA.cuny.edu,1055000
+Example College B,2,Yes,01CUNY_YY,YYY,NYYY,def456,John Doe,jdoe@exampleB.cuny.edu,
+Example Community College,3,No,01CUNY_ZZ,ZZZ,NZZZ,ghi789,Pat Lee,plee@exampleCC.cuny.edu,
