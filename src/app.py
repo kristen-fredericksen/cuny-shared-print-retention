@@ -726,10 +726,14 @@ def main():
                             update_log.append(f"  ✗ Leaving item failed: {item_msg}")
                             continue
 
-                        _, holdings_msg = update_leaving_school_holdings(
+                        holdings_ok, holdings_msg = update_leaving_school_holdings(
                             l_mms_id, l_holding_id, l_item_pid, l_api_key, config["base_url"]
                         )
-                        update_log.append(f"  ✓ Leaving holdings: {holdings_msg}")
+                        if holdings_ok:
+                            update_log.append(f"  ✓ Leaving holdings: {holdings_msg}")
+                        else:
+                            n_errors += 1
+                            update_log.append(f"  ✗ Leaving holdings failed: {holdings_msg}")
 
                         # Phase 4: Update taking school
                         taking_school = schools.get(taking_code, {})
@@ -746,10 +750,14 @@ def main():
                             update_log.append(f"  ✗ Taking item failed: {item_msg}")
                             continue
 
-                        _, holdings_msg = update_taking_school_holdings(
+                        holdings_ok, holdings_msg = update_taking_school_holdings(
                             t_iz_mms_id, t_holding_id, marc_org_code, t_api_key, config["base_url"]
                         )
-                        update_log.append(f"  ✓ Taking holdings: {holdings_msg}")
+                        if holdings_ok:
+                            update_log.append(f"  ✓ Taking holdings: {holdings_msg}")
+                        else:
+                            n_errors += 1
+                            update_log.append(f"  ✗ Taking holdings failed: {holdings_msg}")
 
                         # Phase 5: WorldCat CSV
                         worldcat_result = {

@@ -788,31 +788,30 @@ def update_leaving_school_holdings(mms_id, holding_id, item_pid, api_key, base_u
 
     # No other retained items - safe to remove 583 field
     url = f"{base_url}/almaws/v1/bibs/{mms_id}/holdings/{holding_id}"
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     params = {"apikey": api_key}
 
-    # GET current holdings record
-    response = requests.get(url, params=params, headers=headers)
+    # GET current holdings record as XML (Alma rejects JSON on PUT for holdings)
+    response = requests.get(url, params=params, headers={"Accept": "application/xml"})
     if response.status_code != 200:
         return False, f"GET holdings failed (status {response.status_code}): {response.text}"
 
-    holdings = response.json()
+    marc_xml = response.text
 
-    # Remove 583 fields from MARC XML in the 'anies' field
-    marc_xml = holdings.get("anies", [""])[0]
-    if not marc_xml:
-        return True, "No MARC XML found in holdings - nothing to update"
-
-    # Remove all 583 datafield elements
-    updated_xml = re.sub(r'<datafield tag="583"[^>]*>.*?</datafield>', '', marc_xml, flags=re.DOTALL)
+    # Remove all 583 datafield elements.
+    # Alma returns attributes in ind1/ind2/tag order, so tag is not necessarily first.
+    updated_xml = re.sub(
+        r'<datafield[^>]*tag="583"[^>]*>.*?</datafield>', '', marc_xml, flags=re.DOTALL
+    )
 
     if updated_xml == marc_xml:
         return True, "No 583 field found in holdings - nothing to remove"
 
-    holdings["anies"] = [updated_xml]
-
-    # PUT updated holdings record
-    put_response = requests.put(url, params=params, headers=headers, json=holdings)
+    # PUT updated holdings record as XML
+    put_response = requests.put(
+        url, params=params,
+        headers={"Content-Type": "application/xml"},
+        data=updated_xml.encode("utf-8")
+    )
     if put_response.status_code != 200:
         return False, f"PUT holdings failed (status {put_response.status_code}): {put_response.text}"
 
@@ -1132,24 +1131,19 @@ def update_taking_school_holdings(iz_mms_id, holding_id, marc_org_code, api_key,
     Returns: (success, message)
     """
     url = f"{base_url}/almaws/v1/bibs/{iz_mms_id}/holdings/{holding_id}"
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     params = {"apikey": api_key}
 
-    # GET current holdings record
-    response = requests.get(url, params=params, headers=headers)
+    # GET current holdings record as XML (Alma rejects JSON on PUT for holdings)
+    response = requests.get(url, params=params, headers={"Accept": "application/xml"})
     if response.status_code != 200:
         return False, f"GET holdings failed (status {response.status_code}): {response.text}"
 
-    holdings = response.json()
-    marc_xml = holdings.get("anies", [""])[0]
-    if not marc_xml:
-        return False, "No MARC XML found in holdings record"
+    marc_xml = response.text
 
     # Check if a CUNY Shared Print 583 field already exists.
-    # We look for a 583 that contains both "Committed to retain" and the CUNY
-    # org name, so we don't mistake an unrelated action note for our commitment.
+    # Alma returns attributes in ind1/ind2/tag order, so use a flexible regex.
     existing_583s = re.findall(
-        r'<datafield tag="583"[^>]*>(.*?)</datafield>', marc_xml, flags=re.DOTALL
+        r'<datafield[^>]*tag="583"[^>]*>(.*?)</datafield>', marc_xml, flags=re.DOTALL
     )
     for field_xml in existing_583s:
         has_committed = "Committed to retain" in field_xml or "committed to retain" in field_xml
@@ -1161,19 +1155,20 @@ def update_taking_school_holdings(iz_mms_id, holding_id, marc_org_code, api_key,
     if existing_583s:
         print(f"  ⚠️  Holdings has {len(existing_583s)} existing 583 field(s) that are NOT CUNY Shared Print — adding ours anyway")
 
-    # Build the new 583 field XML
+    # Build the new 583 field XML and insert before the closing </record> tag
     new_583 = build_583_field(marc_org_code)
 
-    # Insert the 583 field before the closing </record> tag
     if "</record>" not in marc_xml:
         return False, "Could not find </record> tag in holdings MARC XML - cannot insert 583"
 
     updated_xml = marc_xml.replace("</record>", f"  {new_583}\n</record>")
 
-    holdings["anies"] = [updated_xml]
-
-    # PUT updated holdings record
-    put_response = requests.put(url, params=params, headers=headers, json=holdings)
+    # PUT updated holdings record as XML
+    put_response = requests.put(
+        url, params=params,
+        headers={"Content-Type": "application/xml"},
+        data=updated_xml.encode("utf-8")
+    )
     if put_response.status_code != 200:
         return False, f"PUT holdings failed (status {put_response.status_code}): {put_response.text}"
 
