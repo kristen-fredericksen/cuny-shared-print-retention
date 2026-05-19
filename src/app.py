@@ -207,7 +207,7 @@ def main():
                 "Barcode":     ["39016013760757", "39016011424125"],
                 "School Code": ["01CUNY_BC", "01CUNY_CC"],
             }),
-            use_container_width=False,
+            width="content",
             hide_index=True,
         )
 
@@ -316,7 +316,7 @@ def main():
                                 for c in r.get("holding_institutions", [])
                             ),
                         } for r in found]),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
 
                 # ── Items skipped (wrong status) ──────────────────────────────
@@ -329,7 +329,7 @@ def main():
                             "Title":   (r.get("title") or "")[:60],
                             "Status":  r.get("item_status", "unknown status"),
                         } for r in ineligible]),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
 
                 # ── Barcodes not found ────────────────────────────────────────
@@ -342,7 +342,7 @@ def main():
                             "Leaving": _school_name(r.get("leaving_school"), schools),
                             "Details": r.get("error", ""),
                         } for r in not_found]),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
 
                 # ── Errors ────────────────────────────────────────────────────
@@ -360,7 +360,7 @@ def main():
                             ) or "",
                             "Error":          r.get("error", ""),
                         } for r in errors]),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
 
                 # ── No eligible replacement ───────────────────────────────────
@@ -373,7 +373,7 @@ def main():
                             "Title":   (r.get("title") or "Unknown")[:60],
                             "Reason":  r.get("no_replacement_reason", ""),
                         } for r in no_repl]),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
 
                 # ── Full results table ────────────────────────────────────────
@@ -400,7 +400,7 @@ def main():
                         "Replacement": _school_name(r.get("replacement_school"), schools),
                         "Details":     detail,
                     })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
                 # ── Downloads ────────────────────────────────────────────────
                 st.subheader("📥 Download outputs")
@@ -568,11 +568,11 @@ def main():
 
                     # Mark all
                     ba_cols = st.columns(2)
-                    if ba_cols[0].button("✅ Mark all Yes", use_container_width=True):
+                    if ba_cols[0].button("✅ Mark all Yes", width="stretch"):
                         for it in awaiting:
                             _set_decision(it.get("barcode", "?"), "✅ Yes — agreed")
                         st.rerun()
-                    if ba_cols[1].button("❌ Mark all No", use_container_width=True):
+                    if ba_cols[1].button("❌ Mark all No", width="stretch"):
                         for it in awaiting:
                             _set_decision(it.get("barcode", "?"), "❌ No — declined")
                         st.rerun()
@@ -595,12 +595,12 @@ def main():
                         )
                         selected_code = school_options[selected_school_name]
                         sc_cols = st.columns(2)
-                        if sc_cols[0].button(f"✅ Yes for {selected_school_name}", use_container_width=True):
+                        if sc_cols[0].button(f"✅ Yes for {selected_school_name}", width="stretch"):
                             for it in awaiting:
                                 if it.get("proposed_school") == selected_code:
                                     _set_decision(it.get("barcode", "?"), "✅ Yes — agreed")
                             st.rerun()
-                        if sc_cols[1].button(f"❌ No for {selected_school_name}", use_container_width=True):
+                        if sc_cols[1].button(f"❌ No for {selected_school_name}", width="stretch"):
                             for it in awaiting:
                                 if it.get("proposed_school") == selected_code:
                                     _set_decision(it.get("barcode", "?"), "❌ No — declined")
@@ -888,7 +888,7 @@ def main():
                         "From":      _school_name(it.get("leaving_school"), schools),
                         "To":        _school_name(it.get("taking_school"), schools),
                         "Completed": (it.get("completed_date") or "")[:10],
-                    } for it in completed_items]), use_container_width=True, hide_index=True)
+                    } for it in completed_items]), width="stretch", hide_index=True)
 
             # ── Commitments removed (no replacement) ─────────────────────────
             if removed_items:
@@ -898,7 +898,7 @@ def main():
                         "Title":     (it.get("title") or "")[:60],
                         "Leaving":   _school_name(it.get("leaving_school"), schools),
                         "Completed": (it.get("completed_date") or "")[:10],
-                    } for it in removed_items]), use_container_width=True, hide_index=True)
+                    } for it in removed_items]), width="stretch", hide_index=True)
 
             # ── No replacement — ask whether to remove commitment ─────────────
             if no_replace_items:
@@ -919,7 +919,7 @@ def main():
                             _school_name(s, schools)
                             for s in it.get("declined_schools", [])
                         ),
-                    } for it in no_replace_items]), use_container_width=True, hide_index=True)
+                    } for it in no_replace_items]), width="stretch", hide_index=True)
 
                     st.markdown("**Remove retention commitments from the leaving school's Alma records?**")
                     remove_confirm = st.button(
