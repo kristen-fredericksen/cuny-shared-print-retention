@@ -589,6 +589,8 @@ def generate_draft_email(titles_for_school, replacement_code, schools):
 
     return {
         "to": f"{chief_name} <{chief_email}>",
+        "to_name": chief_name,
+        "to_email": chief_email,
         "subject": "CUNY Shared Print retention commitment inquiry",
         "body": body,
         "html_body": html_body,
@@ -644,6 +646,60 @@ def save_eml_file(email, output_dir):
     return filepath
 
 
+def create_outlook_draft(email):
+    """
+    Create an Outlook draft message on macOS using AppleScript.
+
+    The draft is saved to Outlook's Drafts folder without opening a compose
+    window, so all drafts accumulate quietly and the user can review and send
+    them at their own pace.
+
+    Args:
+        email: Dictionary with to_name, to_email, subject, body keys
+
+    Returns:
+        (success: bool, message: str)
+    """
+    import subprocess
+
+    def _as_str(text):
+        """Convert a Python string to an AppleScript string expression.
+
+        Handles embedded double-quotes (using AppleScript's quote variable)
+        and newlines (using AppleScript's return constant).
+        """
+        lines = text.split('\n')
+        line_exprs = []
+        for line in lines:
+            parts = line.split('"')
+            line_expr = ' & quote & '.join(f'"{p}"' for p in parts)
+            line_exprs.append(line_expr if line_expr else '""')
+        return ' & return & '.join(line_exprs) if line_exprs else '""'
+
+    subject_as  = _as_str(email['subject'])
+    body_as     = _as_str(email['body'])
+    to_name_as  = _as_str(email.get('to_name', ''))
+    to_email_as = _as_str(email.get('to_email', ''))
+
+    script = f"""tell application "Microsoft Outlook"
+    set msgSubject to {subject_as}
+    set msgBody to {body_as}
+    set msgToName to {to_name_as}
+    set msgToEmail to {to_email_as}
+    set newMsg to make new outgoing message with properties {{subject:msgSubject, plain text content:msgBody}}
+    make new to recipient at newMsg with properties {{email address:{{address:msgToEmail, display name:msgToName}}}}
+    save newMsg
+end tell"""
+
+    result = subprocess.run(
+        ['osascript', '-e', script],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return False, f"AppleScript error: {result.stderr.strip()}"
+    return True, f"Draft saved to Outlook Drafts for {email.get('to_name') or email.get('to_email', '?')}"
+
+
 def print_draft_emails(results, schools, output_dir=None):
     """
     Generate draft emails, batching multiple titles per replacement school.
@@ -691,19 +747,20 @@ def print_draft_emails(results, schools, output_dir=None):
         for t in email['titles']:
             print(f"  - {t['barcode']}: {t['title'][:50]}...")
 
-        # Save as .eml file if output_dir provided
-        if output_dir:
-            filepath = save_eml_file(email, output_dir)
-            saved_files.append(filepath)
-            print(f"  Saved: {filepath}")
+        # Create Outlook draft via AppleScript
+        ok, msg = create_outlook_draft(email)
+        if ok:
+            saved_files.append(msg)
+            print(f"  ✓ {msg}")
         else:
+            print(f"  ✗ {msg}")
+            # Fall back to printing the body
             print("-" * 40)
             print(email['body'])
             print("-" * 40)
 
     if saved_files:
-        print(f"\n✓ Saved {len(saved_files)} .eml file(s) to: {output_dir}")
-        print("  Double-click to open in Outlook as a draft message.")
+        print(f"\n✓ Created {len(saved_files)} draft(s) in Outlook Drafts folder.")
 
     return emails
 
@@ -2238,10 +2295,12 @@ def _handle_decline(item_entry, schools, email_dir):
     }
 
     if email_dir:
-        os.makedirs(email_dir, exist_ok=True)
         email = generate_draft_email([fake_result], next_school, schools)
-        filepath = save_eml_file(email, email_dir)
-        return f"Moved to next school: {schools[next_school]['name']}. New email: {filepath}"
+        ok, msg = create_outlook_draft(email)
+        if ok:
+            return f"Moved to next school: {schools[next_school]['name']}. Draft saved to Outlook."
+        else:
+            return f"Moved to next school: {schools[next_school]['name']}. (Draft failed: {msg})"
     else:
         return f"Moved to next school: {schools[next_school]['name']}."
 

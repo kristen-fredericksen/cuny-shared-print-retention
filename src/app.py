@@ -418,19 +418,9 @@ def main():
                             )
                         st.caption("Save this file — you'll need it for Step 2.")
 
-                # Draft emails zip
+                # Draft emails note
                 with col2:
-                    if os.path.isdir(email_dir) and any(
-                        f.endswith(".eml") for f in os.listdir(email_dir)
-                    ):
-                        zip_bytes = _zip_directory(email_dir)
-                        st.download_button(
-                            "⬇ Download draft emails (.zip)",
-                            data=zip_bytes,
-                            file_name="draft_emails.zip",
-                            mime="application/zip",
-                        )
-                        st.caption("Open each .eml file in your email client, review, and send.")
+                    st.info("✉️ Draft emails saved to your **Outlook Drafts** folder. Open Outlook to review and send them.")
 
                 # ── Log ──────────────────────────────────────────────────────
                 with st.expander("📜 Full log", expanded=False):
@@ -439,7 +429,7 @@ def main():
                 # ── Next steps ───────────────────────────────────────────────
                 st.info(
                     "**Next steps:**\n"
-                    "1. Download and send the draft emails.\n"
+                    "1. Open Outlook, go to Drafts, review and send the emails.\n"
                     "2. Wait for replies from the chief librarians.\n"
                     "3. When you have replies, come back and use **Step 2 — Update**."
                 )
@@ -838,16 +828,7 @@ def main():
 
                     # New draft emails (for declined schools)
                     with dl_cols[1]:
-                        if os.path.isdir(email_dir) and any(
-                            f.endswith(".eml") for f in os.listdir(email_dir)
-                        ):
-                            zip_bytes = _zip_directory(email_dir)
-                            st.download_button(
-                                "⬇ New draft emails (.zip)",
-                                data=zip_bytes,
-                                file_name="draft_emails.zip",
-                                mime="application/zip",
-                            )
+                        st.info("✉️ Any new draft emails (for declined schools) were saved to your **Outlook Drafts** folder.")
 
                     # WorldCat files
                     with dl_cols[2]:
