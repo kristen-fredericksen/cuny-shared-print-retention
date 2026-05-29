@@ -319,10 +319,10 @@ def main():
                         width="stretch", hide_index=True,
                     )
 
-                # ── Items skipped (wrong status) ──────────────────────────────
+                # ── Items skipped (ineligible) ────────────────────────────────
                 if ineligible:
                     st.divider()
-                    st.subheader(f"🚫 Skipped — not in 'Item in place' status ({len(ineligible)})")
+                    st.subheader(f"🚫 Skipped — ineligible ({len(ineligible)})")
                     st.dataframe(
                         pd.DataFrame([{
                             "Barcode": r.get("barcode", ""),

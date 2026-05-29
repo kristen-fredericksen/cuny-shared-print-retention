@@ -325,9 +325,13 @@ def find_holding_institutions(barcode, leaving_school, schools, config):
     Find all institutions that hold a copy of this item.
 
     1. Look up the barcode using the specified school's API key
-    2. Check if item is eligible (base_status = 1)
-    3. Extract the Network Zone MMS ID
-    4. Query the Network Zone to find all holding institutions
+    2. Extract the Network Zone MMS ID
+    3. Query the Network Zone to find all holding institutions
+
+    Note: The leaving school's item status (e.g. "Item not in place") is intentionally
+    NOT used to filter items. Items that are missing or not in place at the leaving school
+    are exactly the kind that may need retention reassigned. Only the replacement school's
+    suitability matters.
 
     Args:
         barcode: The item barcode
@@ -336,7 +340,6 @@ def find_holding_institutions(barcode, leaving_school, schools, config):
         config: Configuration dictionary
 
     Returns: (list of institution codes, bib_info dict)
-    Returns ("ineligible", bib_info) if item status is not "Item in place"
     """
     # Step 1: Look up the item by barcode using the leaving school's API key
     item_data = lookup_item_by_barcode(barcode, leaving_school, schools, config["base_url"])
@@ -351,18 +354,6 @@ def find_holding_institutions(barcode, leaving_school, schools, config):
     except KeyError:
         print("  Could not extract MMS ID from item data")
         return None, None
-
-    # Step 2: Check if item is eligible based on base_status
-    is_eligible, status_desc = check_item_status(item_data)
-    if not is_eligible:
-        print(f"  ⚠️  Item not eligible: {status_desc}")
-        return "ineligible", {
-            "mms_id": iz_mms_id,
-            "nz_mms_id": None,
-            "title": title,
-            "item_data": item_data,
-            "status": status_desc
-        }
 
     # Step 2: Get the Network Zone MMS ID
     nz_mms_id = get_nz_mms_id_from_item(item_data)
