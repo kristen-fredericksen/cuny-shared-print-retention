@@ -2148,9 +2148,13 @@ def _re_verify_leaving_school_ids(result, schools, config):
     stored_holding = stored_bib.get("item_data", {}).get("holding_data", {}).get("holding_id", "")
     stored_pid     = stored_bib.get("item_data", {}).get("item_data", {}).get("pid", "")
 
+    if leaving_code not in schools:
+        return None, None, None, f"Could not re-verify leaving school item — {leaving_code} not found in loaded schools (check sandbox mode)"
+    if not schools[leaving_code].get("api_key"):
+        return None, None, None, f"Could not re-verify leaving school item — no API key configured for {leaving_code}"
     fresh = lookup_item_by_barcode(barcode, leaving_code, schools, config["base_url"])
     if not fresh:
-        return None, None, None, "Could not re-verify leaving school item — barcode no longer found in Alma"
+        return None, None, None, "Could not re-verify leaving school item — barcode not found in Alma"
 
     fresh_mms_id  = fresh.get("bib_data",     {}).get("mms_id",     "")
     fresh_holding = fresh.get("holding_data",  {}).get("holding_id", "")
