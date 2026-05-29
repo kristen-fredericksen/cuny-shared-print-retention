@@ -513,12 +513,21 @@ def generate_draft_email(titles_for_school, replacement_code, schools):
     first_name = chief_name.split()[0] if chief_name else "Colleague"
 
     # Build the titles section (each title with its Primo link for the replacement school)
+    # Deduplicate by NZ MMS ID to avoid the same title appearing twice if a barcode
+    # was processed more than once.
+    seen_nz_ids = set()
     title_lines = []
     titles_info = []
     for result in titles_for_school:
         title = result.get("title", "Unknown title")
         nz_mms_id = result.get("bib_info", {}).get("nz_mms_id")
         primo_link = build_primo_link(nz_mms_id, replacement_school)
+
+        # Skip duplicates (same NZ MMS ID already added)
+        dedup_key = nz_mms_id or title
+        if dedup_key in seen_nz_ids:
+            continue
+        seen_nz_ids.add(dedup_key)
 
         if primo_link:
             title_lines.append(f"{title}\n{primo_link}")
@@ -531,32 +540,54 @@ def generate_draft_email(titles_for_school, replacement_code, schools):
             "primo_link": primo_link
         })
 
-    # Join titles with blank lines between them
+    # Join titles with blank lines between them (plain text)
     titles_section = "\n\n".join(title_lines)
 
+    # Build HTML titles section — one clickable link per title, or plain text if no link
+    html_title_items = []
+    for t in titles_info:
+        if t["primo_link"]:
+            html_title_items.append(f'<a href="{t["primo_link"]}">{t["title"]}</a>')
+        else:
+            html_title_items.append(t["title"])
+    html_titles_section = "<br>\n<br>\n".join(html_title_items)
+
     # Adjust wording based on number of titles
-    if len(titles_for_school) == 1:
+    if len(titles_info) == 1:
         titles_phrase = "this title"
     else:
         titles_phrase = "these titles"
 
-    # Generate the email body
-    body = f"""Hi {first_name},
+    intro = (
+        f"Hi {first_name},\n\n"
+        f"Another CUNY library recently reported that they are no longer able to retain "
+        f"monographs they had previously committed to as part of our shared retention "
+        f"agreement. Rather than withdrawing the titles entirely from the consortium's "
+        f"retention pool, I'm reaching out to ask whether your library would be willing "
+        f"to take over the retention commitment for {titles_phrase}:"
+    )
+    closing = (
+        "If you're open to this, I'll update the relevant records accordingly. "
+        "Please let me know if you'd be willing to assume this commitment or if you "
+        "have any questions before deciding.\n\n"
+        "Thank you for considering this request, and for your continued support of "
+        "our shared collections.\n\n"
+        "- Kristen"
+    )
 
-Another CUNY library recently reported that they are no longer able to retain monographs they had previously committed to as part of our shared retention agreement. Rather than withdrawing the titles entirely from the consortium's retention pool, I'm reaching out to ask whether your library would be willing to take over the retention commitment for {titles_phrase}:
+    # Plain text body
+    body = f"{intro}\n\n{titles_section}\n\n{closing}"
 
-{titles_section}
-
-If you're open to this, I'll update the relevant records accordingly. Please let me know if you'd be willing to assume this commitment or if you have any questions before deciding.
-
-Thank you for considering this request, and for your continued support of our shared collections.
-
-- Kristen"""
+    # HTML body — built directly, not by post-processing plain text
+    html_intro = intro.replace("\n\n", "<br>\n<br>\n").replace("\n", "<br>\n")
+    html_closing = closing.replace("\n\n", "<br>\n<br>\n").replace("\n", "<br>\n")
+    html_body = f"{html_intro}<br>\n<br>\n{html_titles_section}<br>\n<br>\n{html_closing}"
 
     return {
         "to": f"{chief_name} <{chief_email}>",
         "subject": "CUNY Shared Print retention commitment inquiry",
         "body": body,
+        "html_body": html_body,
         "replacement_school": replacement_school["name"],
         "replacement_code": replacement_code,
         "titles": titles_info
@@ -588,20 +619,10 @@ def save_eml_file(email, output_dir):
     # Plain text version
     text_part = MIMEText(email['body'], 'plain', 'utf-8')
 
-    # HTML version with clickable links
-    html_body = email['body'].replace('\n', '<br>\n')
-    # Make URLs clickable
-    for t in email['titles']:
-        if t['primo_link']:
-            # Replace the plain URL with a hyperlink
-            html_body = html_body.replace(
-                t['primo_link'],
-                f'<a href="{t["primo_link"]}">{t["title"]}</a>'
-            )
-            # Remove the title line since it's now in the link
-            html_body = html_body.replace(f'{t["title"]}<br>', '')
-
-    html_part = MIMEText(f'<html><body style="font-family: Arial, sans-serif;">{html_body}</body></html>', 'html', 'utf-8')
+    # HTML version — pre-built in generate_draft_email with proper anchor tags.
+    # Using the pre-built html_body avoids string-replacement fragility (e.g.
+    # replacing a URL that already appears inside an href attribute).
+    html_part = MIMEText(f'<html><body style="font-family: Arial, sans-serif;">{email["html_body"]}</body></html>', 'html', 'utf-8')
 
     msg.attach(text_part)
     msg.attach(html_part)
