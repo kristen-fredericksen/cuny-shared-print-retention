@@ -525,7 +525,17 @@ def main():
             st.divider()
 
             # ── Awaiting-reply items ─────────────────────────────────────────
-            awaiting = [it for it in items if it["status"] == "awaiting_reply"]
+            # Deduplicate by barcode — the same barcode can appear twice in the JSON
+            # if it matched multiple barcodes in the input file, which would cause
+            # duplicate st.radio() keys and crash the app.
+            _seen_barcodes = set()
+            awaiting = []
+            for it in items:
+                if it["status"] == "awaiting_reply":
+                    bc = it.get("barcode", "")
+                    if bc not in _seen_barcodes:
+                        _seen_barcodes.add(bc)
+                        awaiting.append(it)
 
             if not awaiting:
                 st.info("No items are currently awaiting a reply.  Nothing to do right now.")
