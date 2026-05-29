@@ -540,6 +540,10 @@ def generate_draft_email(titles_for_school, replacement_code, schools):
             "primo_link": primo_link
         })
 
+    # Sort alphabetically by title
+    paired = sorted(zip(title_lines, titles_info), key=lambda x: x[1]["title"].lower())
+    title_lines, titles_info = [list(t) for t in zip(*paired)] if paired else ([], [])
+
     # Join titles with blank lines between them (plain text)
     titles_section = "\n\n".join(title_lines)
 
