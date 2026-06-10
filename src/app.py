@@ -554,7 +554,7 @@ def main():
                 # the key "decision_{barcode}". Bulk actions write to the same
                 # keys so there is only one source of truth.
 
-                _OPTIONS = ["(not yet decided)", "✅ Yes — agreed", "❌ No — declined"]
+                _OPTIONS = ["(not yet decided)", "✅ Yes — agreed", "❌ No — declined", "✔ Manually updated"]
 
                 def _set_decision(barcode, value):
                     st.session_state[f"decision_{barcode}"] = value
@@ -641,7 +641,7 @@ def main():
                 ready_count = sum(
                     1 for it in awaiting
                     if _get_decision(it.get("barcode", "?"))
-                    in ("✅ Yes — agreed", "❌ No — declined")
+                    in ("✅ Yes — agreed", "❌ No — declined", "✔ Manually updated")
                 )
 
                 run_update = st.button(
@@ -684,6 +684,13 @@ def main():
                             # Track new email if one was created
                             if "New email:" in msg:
                                 new_emails.append(msg.split("New email:")[-1].strip())
+                            continue
+
+                        if decision == "✔ Manually updated":
+                            it["status"]         = "completed"
+                            it["completed_date"] = datetime.now().isoformat()
+                            n_completed += 1
+                            update_log.append(f"[{barcode}] Marked as manually updated — no API changes made.")
                             continue
 
                         # ── Yes — agreed ─────────────────────────────────────
