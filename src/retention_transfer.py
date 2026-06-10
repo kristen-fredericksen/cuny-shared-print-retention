@@ -576,7 +576,7 @@ def generate_draft_email(titles_for_school, replacement_code, schools):
         "have any questions before deciding.\n\n"
         "Thank you for considering this request, and for your continued support of "
         "our shared collections.\n\n"
-        "- Kristen"
+        "Thanks,\nKristen"
     )
 
     # Plain text body
