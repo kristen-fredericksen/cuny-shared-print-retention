@@ -677,19 +677,21 @@ def create_outlook_draft(email):
         return ' & return & '.join(line_exprs) if line_exprs else '""'
 
     subject_as  = _as_str(email['subject'])
-    body_as     = _as_str(email['body'])
+    # Use the pre-built HTML body so line breaks and hyperlinks render correctly.
+    # Outlook's 'content' property accepts HTML; 'plain text content' strips
+    # formatting and renders links as bare text.
+    body_as     = _as_str(email.get('html_body', email['body']))
     to_email_as = _as_str(email.get('to_email', ''))
 
     # email address must be a record — a plain string fails (-1700).
     # {address:..., display name:...} also fails because "display name" has a space.
     # {address:...} alone (single-word key) works correctly.
     # 'open' is used instead of 'save' — 'save' requires a file path (-1701).
-    # 'open' opens the compose window so the user can review before sending.
     script = f"""tell application "Microsoft Outlook"
     set msgSubject to {subject_as}
     set msgBody to {body_as}
     set msgToEmail to {to_email_as}
-    set newMsg to make new outgoing message with properties {{subject:msgSubject, plain text content:msgBody}}
+    set newMsg to make new outgoing message with properties {{subject:msgSubject, content:msgBody}}
     make new to recipient at newMsg with properties {{email address:{{address:msgToEmail}}}}
     open newMsg
 end tell"""
